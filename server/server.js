@@ -1,5 +1,8 @@
 const path = require("path");
 
+const dns = require("node:dns");
+dns.setServers(["1.1.1.1", "1.0.0.1"]);
+
 require("dotenv").config({
   path: path.join(__dirname, ".env")
 });
@@ -11,6 +14,7 @@ const connectDB = require("./config/db");
 const { createCommunityRouter, defaultModels } = require("./routes/community");
 const { router: styleFeedRouter } = require("./routes/styleFeed");
 const StyleVideo = require("./models/StyleVideo");
+const RequestContact = require('./models/RequestContact');
 // Person 4: business portal + store product catalogue.
 const { createBusinessRouter, createCatalogRouter, defaultModels: businessModels } = require("./routes/business");
 
@@ -21,6 +25,8 @@ const { createWardrobeRouter } = require('./routes/wardrobeRoutes');
 const WardrobeItem = require('./models/WardrobeItem');
 const SavedOutfit = require('./models/SavedOutfit');
 const surveyRoutes = require('./routes/surveyRoutes');
+const commerceRoutes = require('./routes/commerceRoutes');
+const Order = require('./models/Order');
 const { loadUser, requireAuth } = require('./middleware/authentication');
 const User = require('./models/User');
 const AuthSession = require('./models/AuthSession');
@@ -56,9 +62,10 @@ app.use('/api/reports', reportRoutes)
 app.use('/api/admin', adminRoutes)
 app.use('/api/wardrobe', express.json({ limit: '8mb' }), createWardrobeRouter());
 app.use('/api/survey', express.json({ limit: '16kb' }), surveyRoutes);
+app.use('/api/commerce', express.json({ limit: '32kb' }), commerceRoutes);
 app.use("/api/community", express.json({ limit: "8mb" }), createCommunityRouter());
 app.use("/api/style-feed", express.json({ limit: "12mb" }), styleFeedRouter);
-app.use("/api/business", express.json({ limit: "8mb" }), createBusinessRouter());
+app.use("/api/business", express.json({ limit: "16mb" }), createBusinessRouter());
 app.use("/api/catalog", express.json({ limit: "16kb" }), createCatalogRouter());
 app.use(express.json());
 
@@ -89,7 +96,7 @@ function ensureReady() {
       }
       await connectDB();
       await Promise.all([WardrobeItem.init(), SavedOutfit.init(), defaultModels.Purchase.init(), defaultModels.Listing.init(), defaultModels.Request.init(), defaultModels.Response.init(), User.init(), AuthSession.init(),
-        businessModels.Business.init(), businessModels.Product.init(), businessModels.CoinTransaction.init(), businessModels.SkipFeedback.init(), StyleVideo.init()]);
+      businessModels.Business.init(), RequestContact.init(), businessModels.Product.init(), businessModels.CoinTransaction.init(), businessModels.SkipFeedback.init(), StyleVideo.init(), Order.init()]);
     })().catch((error) => {
       readyPromise = undefined; // let the next request try again
       throw error;

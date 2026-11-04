@@ -1,14 +1,18 @@
 const mongoose = require('mongoose');
 const validation = require('../communityValidation');
 const { listedColours } = require('../services/listedColours');
+const { sizeStockMap } = require('../services/sizeStock');
 const defaultModels = {
   Listing: require('../models/CommunityListing'),
   Request: require('../models/OutfitRequest'),
   Response: require('../models/RequestResponse'),
   User: require('../models/User'),
   Product: require('../models/Product'),
+  Business: require('../models/Business'),
   Item: require('../models/WardrobeItem'),
   Purchase: require('../models/RequestPurchase'),
+  StyleVideo: require('../models/StyleVideo'),
+  Contact: require('../models/RequestContact'),
 };
 
 const { actorFor } = require('../middleware/community');
@@ -35,63 +39,32 @@ function requestJson(doc) {
     title: doc.title, occasion: doc.occasion, description: doc.description, budget: doc.budget,
     preferredStyle: doc.preferredStyle, deadline: doc.deadline, status: doc.status, createdAt: doc.createdAt,
     acceptedResponseId: doc.acceptedResponseId ? String(doc.acceptedResponseId) : null,
-    fulfilled: !!doc.purchaseId
+    expired: !!doc.expiredAt, closedByCustomer: !!doc.closedByCustomer, fulfilled: !!doc.purchaseId
   };
 }
 
 function createCommunityController(models = defaultModels) {
   const { Listing, Request, Response, User, Product } = models;
-  const { FREE_REQUESTS, EXTRA_REQUEST_CREDITS, CREDIT_PACKAGES } = validation;
-
-  // ---------- Credits: the first few open requests are free, each one after that costs credits ----------
-  // Requests past their needed-by date no longer use up a free slot.
-  function openRequestCount(consumerId) {
-    return Request.countDocuments({ consumerId, deletedAt: null, status: 'open', deadline: { $gte: validation.singaporeToday() } });
-  }
-  async function creditBalance(consumerId) {
-    const user = idIsValid(consumerId) ? await User.findById(consumerId) : null;
-    return user?.credits ?? 0;
-  }
-  async function walletJson(consumerId) {
-    const [credits, openCount] = await Promise.all([creditBalance(consumerId), openRequestCount(consumerId)]);
-    return { credits, openCount, freeRequests: FREE_REQUESTS, extraRequestCost: EXTRA_REQUEST_CREDITS, packages: CREDIT_PACKAGES };
-  }
-  // Returns how many credits were taken (0 while the customer is inside the free allowance).
-  async function chargeForExtraRequest(consumerId) {
-    if (await openRequestCount(consumerId) < FREE_REQUESTS) return 0;
-    const updated = idIsValid(consumerId) && await User.findOneAndUpdate({ _id: consumerId, credits: { $gte: EXTRA_REQUEST_CREDITS } },
-      { $inc: { credits: -EXTRA_REQUEST_CREDITS } }, { returnDocument: 'after' });
-    if (!updated) {
-      const error = new Error(`You've used your ${FREE_REQUESTS} free open requests. Another one costs ${EXTRA_REQUEST_CREDITS} credits. Buy credits, or close a request first.`);
-      error.status = 409;
-      throw error;
-    }
-    return EXTRA_REQUEST_CREDITS;
-  }
-  async function refundCredits(consumerId, amount) {
-    if (amount) await User.updateOne({ _id: consumerId }, { $inc: { credits: amount } });
-  }
-
-  async function getCredits(req, res) {
-    res.set('Cache-Control', 'no-store');
-    res.json(await walletJson(req.communityActor.id));
-  }
-
-  // Simulated payment for the demo, like the business coins: no card details, the balance is simply topped up.
-  async function purchaseCredits(req, res) {
-    const amount = req.body?.credits;
-    if (!CREDIT_PACKAGES.includes(amount)) throw validation.badRequest('Choose one of the credit packages.');
-    const id = req.communityActor.id;
-    const updated = idIsValid(id) && await User.findOneAndUpdate({ _id: id }, { $inc: { credits: amount } }, { returnDocument: 'after' });
-    if (!updated) return res.status(404).json({ message: 'Sign in with a customer account to buy credits.' });
-    res.json(await walletJson(id));
+  const Contact = models.Contact || require('../models/RequestContact');
+  const Business = models.Business || require('../models/Business');
+  // Outfit Requests are free to post. Business Style Feed boosts remain coin-funded.
+  // Expire only unaccepted requests. Accepted ones remain eligible for checkout.
+  async function expireRequests() {
+    await Request.updateMany({ deletedAt: null, status: 'open', acceptedResponseId: null, deadline: { $lt: validation.singaporeToday() } },
+      { $set: { status: 'closed', expiredAt: new Date() } });
   }
 
   async function requestSummaries(items) {
-    const replies = items.length ? await Response.find({ requestId: { $in: items.map(item => item._id) } }).select('requestId createdAt') : [];
+    const ids = items.map(item => item._id);
+    const [replies, contacts] = ids.length ? await Promise.all([
+      Response.find({ requestId: { $in: ids } }).select('requestId createdAt'),
+      Contact.find({ requestId: { $in: ids } }).select('requestId createdAt'),
+    ]) : [[], []];
     const counts = new Map();
     for (const reply of replies) counts.set(String(reply.requestId), (counts.get(String(reply.requestId)) || 0) + 1);
-    return items.map(item => ({ ...requestJson(item), suggestionCount: counts.get(String(item._id)) || 0 }));
+    const messages = new Map();
+    for (const contact of contacts) messages.set(String(contact.requestId), (messages.get(String(contact.requestId)) || 0) + 1);
+    return items.map(item => ({ ...requestJson(item), suggestionCount: counts.get(String(item._id)) || 0, messageCount: messages.get(String(item._id)) || 0 }));
   }
 
   function pageNumber(value) {
@@ -155,13 +128,8 @@ function createCommunityController(models = defaultModels) {
       if (existing.deadline < validation.singaporeToday()) throw validation.badRequest('This request is past its needed-by date. Post a new request instead.');
       filter.deadline = { $gte: validation.singaporeToday() };
     }
-    // Reopening a closed request takes a slot again, so it is charged like a new one.
-    const charged = status === 'open' && existing.status !== 'open' ? await chargeForExtraRequest(req.communityActor.id) : 0;
-    const item = await Request.findOneAndUpdate(filter, { $set: { status, acceptedResponseId: null, acceptedAt: null } }, { returnDocument: 'after', runValidators: true });
-    if (!item) {
-      await refundCredits(req.communityActor.id, charged);
-      return res.status(409).json({ message: 'The request changed. Refresh and try again.' });
-    }
+    const item = await Request.findOneAndUpdate(filter, { $set: { status, expiredAt: null, closedByCustomer: status === 'closed', acceptedResponseId: null, acceptedAt: null } }, { returnDocument: 'after', runValidators: true });
+    if (!item) return res.status(409).json({ message: 'The request changed. Refresh and try again.' });
     res.json({ request: requestJson(item) });
   }
 
@@ -185,12 +153,18 @@ function createCommunityController(models = defaultModels) {
       if (!listing && !request) return res.status(404).json({ message: 'Member not found.' });
       user = { name: listing?.ownerName || request.consumerName, role: 'consumer' };
     }
+    const actor = actorFor(req);
+    const ownHistory = actor?.id === id && ['consumer', 'customer'].includes(actor.role);
+    if (ownHistory || actor?.role === 'business') await expireRequests();
+    const canBrowseHistory = ownHistory || actor?.role === 'business';
     const listingPage = pageNumber(req.query.listingsPage), requestPage = pageNumber(req.query.requestsPage), pageSize = 12;
     const [listings, listingTotal, requests, requestTotal] = await Promise.all([
       Listing.find({ ownerId: id }).sort({ createdAt: -1, _id: -1 }).skip((listingPage - 1) * pageSize).limit(pageSize),
       Listing.countDocuments({ ownerId: id }),
-      Request.find({ consumerId: id, deletedAt: null }).sort({ status: -1, createdAt: -1, _id: -1 }).skip((requestPage - 1) * pageSize).limit(pageSize),
-      Request.countDocuments({ consumerId: id, deletedAt: null })
+      ...(canBrowseHistory ? [
+        Request.find({ consumerId: id, deletedAt: null }).sort({ status: -1, createdAt: -1, _id: -1 }).skip((requestPage - 1) * pageSize).limit(pageSize),
+        Request.countDocuments({ consumerId: id, deletedAt: null })
+      ] : [Promise.resolve([]), Promise.resolve(0)])
     ]);
     // Public profile data only: no email, password, session, or preferences.
     res.json({ member: { id, name: user.name, role: user.role },
@@ -261,7 +235,13 @@ function createCommunityController(models = defaultModels) {
   }
 
   async function getRequests(req, res) {
-    const filter = { deletedAt: null };
+    const actor = actorFor(req);
+    if (!actor) return res.status(401).json({ message: 'Sign in to view requests.' });
+    const isCustomer = ['consumer', 'customer'].includes(actor.role);
+    if (!isCustomer && actor.role !== 'business') return res.status(403).json({ message: 'This page is not available for this account.' });
+    await expireRequests();
+    // Businesses can browse non-deleted community request history; customer accounts only see their own.
+    const filter = { deletedAt: null, ...(isCustomer ? { consumerId: actor.id } : {}) };
     const search = cleanQuery(req.query.search);
     if (search) filter.title = { $regex: escapeRegex(search), $options: 'i' };
     const style = cleanQuery(req.query.style);
@@ -270,13 +250,6 @@ function createCommunityController(models = defaultModels) {
     const status = cleanQuery(req.query.status);
     if (status && !['open', 'closed'].includes(status)) throw validation.badRequest('Choose open or closed requests.');
     if (status) filter.status = status;
-    let mine = null;
-    if (req.query.mine === 'true') {
-      const actor = actorFor(req);
-      if (!actor) return res.status(401).json({ message: 'Sign in to see your requests.' });
-      filter.consumerId = actor.id;
-      mine = actor.id;
-    }
     const pageText = cleanQuery(req.query.page, 8) || '1';
     if (!/^[1-9]\d{0,4}$/.test(pageText)) throw validation.badRequest('Choose a valid page.');
     const page = Number(pageText), pageSize = 12;
@@ -286,7 +259,54 @@ function createCommunityController(models = defaultModels) {
       Request.countDocuments(filter)
     ]);
     res.set('Cache-Control', 'no-store');
-    res.json({ requests: await requestSummaries(items), total, page, pageSize, ...(mine ? { wallet: await walletJson(mine) } : {}) });
+    res.json({ requests: await requestSummaries(items), total, page, pageSize });
+  }
+
+  // Browse by customer profile, not by request row. Paginating after grouping
+  // prevents one customer's history from being split across profile cards.
+  async function getRequestProfiles(req, res) {
+    const actor = actorFor(req);
+    if (!actor) return res.status(401).json({ message: 'Sign in to view customer profiles.' });
+    if (actor.role !== 'business') return res.status(403).json({ message: 'Only business accounts can browse customer profiles.' });
+    await expireRequests();
+    const status = cleanQuery(req.query.status);
+    if (status && !['open', 'closed'].includes(status)) throw validation.badRequest('Choose open or closed requests.');
+    const search = cleanQuery(req.query.search);
+    const page = pageNumber(req.query.page), pageSize = 8;
+    const filter = { deletedAt: null };
+    if (status) filter.status = status;
+    if (search) {
+      const expression = { $regex: escapeRegex(search), $options: 'i' };
+      filter.$or = [{ consumerName: expression }, { title: expression }];
+    }
+    // Only non-deleted requests are grouped. Each card represents a single
+    // customer; name sorting is stable even when multiple customers share a name.
+    const [result = {}] = await Request.aggregate([
+      { $match: filter },
+      { $sort: { createdAt: -1, _id: -1 } },
+      { $group: {
+        _id: '$consumerId', consumerName: { $first: '$consumerName' },
+        requestCount: { $sum: 1 },
+        openCount: { $sum: { $cond: [{ $eq: ['$status', 'open'] }, 1, 0] } },
+        closedCount: { $sum: { $cond: [{ $eq: ['$status', 'closed'] }, 1, 0] } },
+        latestTitle: { $first: '$title' }, latestRequestAt: { $first: '$createdAt' }
+      } },
+      { $sort: { consumerName: 1, _id: 1 } },
+      { $facet: {
+        metadata: [{ $count: 'total' }],
+        profiles: [{ $skip: (page - 1) * pageSize }, { $limit: pageSize }]
+      } }
+    ]);
+    res.set('Cache-Control', 'no-store');
+    res.json({
+      profiles: (result.profiles || []).map(profile => ({
+        consumerId: profile._id, consumerName: profile.consumerName,
+        requestCount: profile.requestCount, openCount: profile.openCount,
+        closedCount: profile.closedCount, latestTitle: profile.latestTitle,
+        latestRequestAt: profile.latestRequestAt
+      })),
+      total: result.metadata?.[0]?.total || 0, page, pageSize
+    });
   }
 
   async function createRequest(req, res) {
@@ -294,12 +314,10 @@ function createCommunityController(models = defaultModels) {
     const key = { consumerId: actor.id, clientRequestId: input.clientRequestId };
     const existing = await Request.findOne(key);
     if (existing) return res.json({ request: requestJson(existing) });
-    const charged = await chargeForExtraRequest(actor.id);
     try {
       const item = await Request.create({ ...input, consumerId: actor.id, consumerName: actor.name });
-      res.status(201).json({ request: requestJson(item), creditsSpent: charged });
+      res.status(201).json({ request: requestJson(item) });
     } catch (error) {
-      await refundCredits(actor.id, charged);
       if (error.code !== 11000) throw error;
       const saved = await Request.findOne(key);
       if (!saved) throw error;
@@ -309,14 +327,30 @@ function createCommunityController(models = defaultModels) {
 
   async function getRequest(req, res) {
     if (!idIsValid(req.params.id)) return res.status(404).json({ message: 'Request not found.' });
+    await expireRequests();
     const item = await Request.findOne({ _id: req.params.id, deletedAt: null });
     if (!item) return res.status(404).json({ message: 'Request not found.' });
-    const responses = await Response.find({ requestId: item._id }).sort({ createdAt: -1 });
+    const actor = actorFor(req);
+    if (!actor) return res.status(401).json({ message: 'Please sign in.' });
+    const owner = actor.id === item.consumerId && ['consumer', 'customer'].includes(actor.role);
+    const isBusiness = actor.role === 'business';
+    const isAdmin = actor.role === 'admin';
+    let ownBusinessReplies = [];
+    if (!owner && isBusiness) {
+      const business = await Business.findOne({ ownerId: actor.id });
+      if (business) ownBusinessReplies = await Response.find({ requestId: item._id, businessId: String(business._id) });
+    } else if (!owner && !isAdmin) {
+      return res.status(404).json({ message: 'Request not found.' });
+    }
+
+    const responses = (owner || isAdmin)
+      ? await Response.find({ requestId: item._id }).sort({ createdAt: -1 })
+      : ownBusinessReplies;
     const productIds = responses.map(reply => reply.productId).filter(idIsValid);
     const products = Product && productIds.length ? await Product.find({ _id: { $in: productIds }, status: 'active' }) : [];
     const byId = new Map(products.map(product => [String(product._id), product]));
     res.set('Cache-Control', 'no-store');
-    res.json({ request: requestJson(item), responses: responses.map(reply => ({
+    res.json({ request: { ...requestJson(item), ...(!owner ? { acceptedResponseId: ownBusinessReplies.some(reply => String(reply._id) === String(item.acceptedResponseId)) ? String(item.acceptedResponseId) : null } : {}) }, responses: responses.map(reply => ({
       responseId: String(reply._id), requestId: String(reply.requestId), businessId: reply.businessId,
       businessName: reply.businessName, productId: reply.productId, productName: reply.productName,
       productPrice: reply.productPrice, message: reply.message, createdAt: reply.createdAt,
@@ -324,7 +358,7 @@ function createCommunityController(models = defaultModels) {
         const p = byId.get(reply.productId);
         if (!p || p.businessId !== reply.businessId) return null;
         return { productId: String(p._id), businessName: p.businessName, name: p.name, price: p.price,
-          category: p.category, style: p.style, sizes: p.sizes, occasions: p.occasions, stock: p.stock,
+          category: p.category, style: p.style, sizes: p.sizes, occasions: p.occasions, stock: p.stock, sizeStock: sizeStockMap(p),
           colours: listedColours(p), material: p.material || null,
           availableColours: listedColours(p),
           imageURL: `/api/catalog/products/${p._id}/image`, reasons: [p.price <= item.budget ? 'Within your budget' : 'Above your budget'] };
@@ -332,8 +366,61 @@ function createCommunityController(models = defaultModels) {
     })) });
   }
 
-  return { getSession, getCredits, purchaseCredits, getListings, createListing, getListingImage, getListing, getRequests, createRequest, getRequest,
-    getMyListings, updateListing, setListingStatus, deleteListing, setRequestStatus, deleteRequest, getMember };
+  async function contactContext(req) {
+    if (!idIsValid(req.params.id)) throw Object.assign(new Error('Request not found.'), { status: 404 });
+    const actor = actorFor(req);
+    if (!actor) throw Object.assign(new Error('Please sign in.'), { status: 401 });
+    const item = await Request.findOne({ _id: req.params.id, deletedAt: null });
+    if (!item) throw Object.assign(new Error('Request not found.'), { status: 404 });
+    const owner = ['consumer', 'customer'].includes(actor.role) && actor.id === item.consumerId;
+    if (!owner && actor.role !== 'business') throw Object.assign(new Error('Request not found.'), { status: 404 });
+    const business = owner ? null : await Business.findOne({ ownerId: actor.id });
+    if (!owner && !business) throw Object.assign(new Error('Create a business profile to contact customers.'), { status: 409 });
+    return { item, actor, owner, business };
+  }
+
+  async function getContacts(req, res) {
+    const { item, owner, business } = await contactContext(req);
+    const contacts = await Contact.find({ requestId: item._id, ...(owner ? {} : { businessId: String(business._id) }) }).sort({ createdAt: 1, _id: 1 });
+    const threads = new Map();
+    for (const contact of contacts) {
+      const id = contact.businessId;
+      if (!threads.has(id)) threads.set(id, { businessId: id, businessName: contact.businessName, messages: [] });
+      threads.get(id).messages.push({ id: String(contact._id), senderRole: contact.senderRole, text: contact.text, createdAt: contact.createdAt });
+    }
+    res.set('Cache-Control', 'no-store');
+    res.json({ threads: [...threads.values()] });
+  }
+
+  async function sendContact(req, res) {
+    const { item, owner, actor, business } = await contactContext(req);
+    const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+    if (!text || text.length > 600) throw validation.badRequest('Write a message of up to 600 characters.');
+    let businessId;
+    let businessName;
+    if (owner) {
+      businessId = typeof req.body?.businessId === 'string' ? req.body.businessId : '';
+      if (!idIsValid(businessId)) throw validation.badRequest('Choose a business conversation.');
+      // A customer may reply only to an existing conversation—not message arbitrary businesses.
+      const earlier = await Contact.findOne({ requestId: item._id, businessId, customerId: actor.id });
+      if (!earlier) throw Object.assign(new Error('This conversation does not exist.'), { status: 404 });
+      businessName = earlier.businessName;
+    } else {
+      businessId = String(business._id);
+      businessName = business.businessName;
+    }
+    // Alternating messages prevents repeated unsolicited follow-ups while preserving two-way contact.
+    const previous = await Contact.find({ requestId: item._id, businessId }).sort({ createdAt: -1, _id: -1 }).limit(1);
+    if (previous[0]?.senderRole === (owner ? 'customer' : 'business')) {
+      return res.status(409).json({ message: owner ? 'The business has not replied yet.' : 'You have already sent a message. Wait for the customer to reply.' });
+    }
+    const saved = await Contact.create({ requestId: item._id, customerId: item.consumerId, businessId, businessName,
+      senderRole: owner ? 'customer' : 'business', text });
+    res.status(201).json({ message: { id: String(saved._id), senderRole: saved.senderRole, text: saved.text, createdAt: saved.createdAt } });
+  }
+
+  return { getSession, getListings, createListing, getListingImage, getListing, getRequests, createRequest, getRequest,
+    getMyListings, updateListing, setListingStatus, deleteListing, setRequestStatus, deleteRequest, getMember, getContacts, sendContact, getRequestProfiles };
 }
 
 module.exports = { createCommunityController, defaultModels };

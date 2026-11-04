@@ -6,14 +6,10 @@ import { authState } from '../../services/authService'
 const blankRequest = () => ({ title: '', occasion: '', budget: '', preferredStyle: '', deadline: '', description: '' })
 export default {
   components: { CommunityIcon, RequestCard },
-  data() { return { requests: [], total: 0, page: 1, pageSize: 12, loading: false, loadVersion: 0, wallet: null, buying: false, creditNotice: '',
-    error: '', formError: '', posting: false, styles, form: blankRequest(),
-    refreshError: '', deletingId: '', deleteError: '', filters: { search: '', style: '', status: '' }, clientRequestId: crypto.randomUUID() } },
+  data() { return { requests: [], profiles: [], total: 0, page: 1, pageSize: 12, loading: false, loadVersion: 0, error: '', formError: '', posting: false, styles, form: blankRequest(),
+    refreshError: '', deletingId: '', deleteError: '', statusFilter: 'all', search: '', clientRequestId: crypto.randomUUID() } },
   computed: {
-    canPost() { return ['consumer', 'customer'].includes(authState.user?.role) }, minimumDate() { return today() },
-    // Credits: the first few open requests are free, each one after that costs credits.
-    freeLeft() { return this.wallet ? Math.max(0, this.wallet.freeRequests - this.wallet.openCount) : 1 },
-    canAfford() { return this.freeLeft > 0 || this.wallet.credits >= this.wallet.extraRequestCost },
+    canPost() { return ['consumer', 'customer'].includes(authState.user?.role) }, isBusiness() { return authState.user?.role === 'business' }, minimumDate() { return today() },
   },
   mounted() {
     this.loadRequests()
@@ -33,13 +29,13 @@ export default {
       if (!quiet) this.loading = true
       this.error = ''; this.refreshError = ''
       try {
-        // Customers see only their own requests. The business board continues to
-        // expose the full request pool, which businesses need to answer.
-        const filters = this.canPost ? { mine: true, page } : { ...this.filters, page }
-        const result = await communityApi(`/requests?${queryString(filters)}`)
+        const filters = this.isBusiness ? { status: this.statusFilter === 'all' ? '' : this.statusFilter, search: this.search, page } : { mine: true, page }
+        const endpoint = this.isBusiness ? '/requests/profiles' : '/requests'
+        const result = await communityApi(`${endpoint}?${queryString(filters)}`)
         if (version !== this.loadVersion) return
-        this.requests = result.requests; this.total = result.total; this.page = result.page; this.pageSize = result.pageSize
-        if (result.wallet) this.wallet = result.wallet
+        if (this.isBusiness) this.profiles = result.profiles
+        else this.requests = result.requests
+        this.total = result.total; this.page = result.page; this.pageSize = result.pageSize
       } catch (error) { if (version === this.loadVersion) { if (quiet) this.refreshError = error.message; else this.error = error.message } }
       finally { if (version === this.loadVersion) this.loading = false }
     },
@@ -53,15 +49,6 @@ export default {
         await this.loadRequests(nextPage)
       } catch (error) { this.deleteError = error.message }
       finally { this.deletingId = '' }
-    },
-    async buyCredits(credits) {
-      if (this.buying) return
-      this.buying = true; this.formError = ''; this.creditNotice = ''
-      try {
-        this.wallet = await communityApi('/credits/purchase', { method: 'POST', body: JSON.stringify({ credits }) })
-        this.creditNotice = `Added ${credits} credits (demo payment).`
-      } catch (error) { this.formError = error.message }
-      finally { this.buying = false }
     },
     async postRequest() {
       if (this.posting || !this.$refs.requestForm.reportValidity()) return
@@ -78,40 +65,47 @@ export default {
 </script>
 <template>
   <section class="request-board-page" aria-labelledby="request-board-heading">
-        <div class="request-board-layout" :class="{ 'request-board-readonly': !canPost }">
+        <div class="request-board-layout" :class="{ 'request-board-readonly': isBusiness }">
       <div class="request-board-content">
         <div class="request-board-heading">
-          <h1 id="request-board-heading">{{ canPost ? 'My outfit requests' : 'Outfit request board' }}</h1>
-          <p>{{ canPost ? 'Keep track of your requests and suggestions from businesses.' : 'Browse customers’ requests and discover what they need.' }}</p>
+          <h1 id="request-board-heading">{{ isBusiness ? 'Community outfit requests' : 'My outfit requests' }}</h1>
+          <p>{{ isBusiness ? 'Browse outfit requests by customer profile, including closed and expired requests.' : 'Keep track of your requests and suggestions from businesses.' }}</p>
         </div>
 
-        <form v-if="!canPost" class="request-toolbar" @submit.prevent="loadRequests(1)">
-          <div class="community-select-wrap"><label for="request-status-filter" class="visually-hidden">Request status</label><select id="request-status-filter" v-model="filters.status" class="community-select" @change="loadRequests(1)"><option value="">Open &amp; closed</option><option value="open">Open only</option><option value="closed">Closed only</option></select></div>
-          <div class="community-search"><button type="submit" aria-label="Search requests"><CommunityIcon name="search" /></button><label for="request-search" class="visually-hidden">Search requests</label><input id="request-search" v-model.trim="filters.search" maxlength="80" type="search" placeholder="Search requests (e.g. jacket, dress)" @change="loadRequests(1)" /></div>
-          <div class="community-select-wrap"><label for="request-style-filter" class="visually-hidden">Filter requests by style</label><select id="request-style-filter" v-model="filters.style" class="community-select" @change="loadRequests(1)"><option value="">All styles</option><option v-for="style in styles" :key="style">{{ style }}</option></select><CommunityIcon name="chevron" :size="16" /></div>
+        <form v-if="isBusiness" class="d-flex flex-wrap align-items-end gap-2 mb-4" role="search" @submit.prevent="loadRequests(1)">
+          <div><label for="community-request-status" class="form-label">Status</label><select id="community-request-status" v-model="statusFilter" class="form-select" @change="loadRequests(1)"><option value="all">All requests</option><option value="open">Open</option><option value="closed">Closed / Expired</option></select></div>
+          <div><label for="community-request-search" class="form-label">Search requests</label><input id="community-request-search" v-model.trim="search" class="form-control" maxlength="80" placeholder="Customer name or item" /></div>
+          <button class="community-btn community-btn-outline" type="submit">Search</button>
         </form>
         <p v-if="refreshError || deleteError" class="community-error" role="alert">{{ deleteError || refreshError }}</p>
         <p v-if="loading" role="status" class="community-loading">Loading community requests…</p>
         <div v-else-if="error" class="community-error" role="alert">{{ error }} <button class="community-text-button" @click="loadRequests(page)">Try again</button></div>
         <template v-else>
-          <p class="visually-hidden" role="status">{{ total }} {{ canPost ? 'of your requests' : 'requests' }}</p>
-          <div v-if="!requests.length" class="community-empty"><CommunityIcon name="hanger" :size="44" /><h2>{{ canPost ? 'Your next outfit starts here' : 'No requests found' }}</h2><p>{{ canPost ? 'You haven’t posted any requests yet.' : 'No matching requests yet.' }}</p><a v-if="canPost" href="#request-title" class="community-text-button" @click.prevent="$refs.requestTitle.focus()">Create a request <CommunityIcon name="arrow" /></a></div>
-          <template v-for="(request, index) in requests" :key="request.requestId">
-            <p v-if="request.status === 'closed' && (index === 0 || requests[index - 1].status !== 'closed')" class="request-section-divider">{{ canPost ? 'History' : 'Closed requests' }}</p>
-            <RequestCard :request="request" :index="index" :personal="canPost" :deleting="deletingId === request.requestId" @delete-request="deleteRequest" />
+          <p class="visually-hidden" role="status">{{ total }} {{ isBusiness ? 'customer profiles with matching requests' : 'of your requests' }}</p>
+          <div v-if="!(isBusiness ? profiles.length : requests.length)" class="community-empty"><CommunityIcon name="hanger" :size="44" /><h2>{{ isBusiness ? 'No requests found' : 'Your next outfit starts here' }}</h2><p>{{ isBusiness ? 'Try another status or search.' : 'You haven’t posted any requests yet.' }}</p><a v-if="canPost" href="#request-title" class="community-text-button" @click.prevent="$refs.requestTitle.focus()">Create a request <CommunityIcon name="arrow" /></a></div>
+          <div v-if="isBusiness && profiles.length" class="community-profile-grid">
+            <article v-for="profile in profiles" :key="profile.consumerId" class="community-panel community-profile-summary">
+              <div class="d-flex align-items-center gap-3 mb-3">
+                <span class="community-avatar community-avatar-small" aria-hidden="true">{{ initial(profile.consumerName) }}</span>
+                <div>
+                  <h2 class="h5 mb-1">{{ profile.consumerName || 'Community member' }}</h2>
+                  <p class="community-muted small mb-0">{{ profile.requestCount }} {{ profile.requestCount === 1 ? 'request' : 'requests' }}{{ statusFilter === 'all' ? '' : ' matching this filter' }}</p>
+                </div>
+              </div>
+              <p v-if="statusFilter === 'all'" class="community-muted small mb-2">{{ profile.openCount }} open · {{ profile.closedCount }} closed or expired</p>
+              <p class="community-muted small mb-3">Latest: {{ profile.latestTitle }}</p>
+              <RouterLink :to="{ name: 'community-member', params: { userId: profile.consumerId } }" class="community-btn community-btn-outline">View customer requests <CommunityIcon name="arrow" :size="16" /></RouterLink>
+            </article>
+          </div>
+          <template v-if="!isBusiness" v-for="(request, index) in requests" :key="request.requestId">
+            <p v-if="request.status === 'closed' && (index === 0 || requests[index - 1].status !== 'closed')" class="request-section-divider">History</p>
+            <RequestCard :request="request" :index="index" :personal="true" :deleting="deletingId === request.requestId" @delete-request="deleteRequest" />
           </template>
-          <nav v-if="total > pageSize" class="community-pagination" aria-label="Request pages"><button class="community-btn community-btn-outline" :disabled="page === 1" @click="loadRequests(page - 1)">Previous</button><span>Page {{ page }}</span><button class="community-btn community-btn-outline" :disabled="page * pageSize >= total" @click="loadRequests(page + 1)">Next</button></nav>
+          <nav v-if="total > pageSize" class="community-pagination" aria-label="Request pages"><button class="community-btn community-btn-outline" :disabled="page === 1" @click="loadRequests(page - 1)">Previous</button><span>Page {{ page }} of {{ Math.ceil(total / pageSize) }}</span><button class="community-btn community-btn-outline" :disabled="page * pageSize >= total" @click="loadRequests(page + 1)">Next</button></nav>
         </template>
       </div>
       <form v-if="canPost" ref="requestForm" class="request-create-panel" @submit.prevent="postRequest" @input="markChanged" @change="markChanged" :aria-busy="posting">
         <h2>Post a request</h2><p class="request-create-intro">Tell the community what you’re looking for and find a piece that feels like you.</p>
-        <div v-if="wallet" class="request-create-intro" role="status">
-          <p class="mb-1">{{ freeLeft ? `${freeLeft} of ${wallet.freeRequests} free open requests left.` : `You’ve used your ${wallet.freeRequests} free open requests. Each extra one costs ${wallet.extraRequestCost} credits.` }} <strong>You have {{ wallet.credits }} credits.</strong></p>
-          <p v-if="!freeLeft" class="mb-1">Buy credits (demo payment):
-            <button v-for="pack in wallet.packages" :key="pack" type="button" class="community-text-button" :disabled="buying" @click="buyCredits(pack)">{{ pack }}</button>
-          </p>
-          <p v-if="creditNotice" class="mb-1">{{ creditNotice }}</p>
-        </div>
         <fieldset :disabled="posting" class="border-0 p-0 m-0">
           <div class="request-field"><label for="request-title" class="form-label">Looking for <span aria-hidden="true">*</span></label><input id="request-title" ref="requestTitle" v-model.trim="form.title" class="form-control" required maxlength="100" placeholder="e.g. dress, jacket, jeans, shoes" /></div>
           <div class="request-field"><label for="request-occasion" class="form-label">Occasion <span aria-hidden="true">*</span></label><input id="request-occasion" v-model.trim="form.occasion" class="form-control" list="occasion-choices" required maxlength="80" placeholder="Choose or enter an occasion" /><datalist id="occasion-choices"><option>University presentation</option><option>Interview</option><option>Wedding</option><option>Date</option><option>Casual outing</option></datalist></div>
@@ -120,7 +114,7 @@ export default {
           <div class="request-field"><label for="request-deadline" class="form-label">Needed by <span aria-hidden="true">*</span></label><input id="request-deadline" v-model="form.deadline" type="date" class="form-control" :min="minimumDate" required /></div>
           <div class="request-field"><label for="request-description" class="form-label">Additional details <span aria-hidden="true">*</span></label><textarea id="request-description" v-model.trim="form.description" class="form-control" rows="3" maxlength="1000" required placeholder="Add any specific details (e.g. colour, size, brand preferences)."></textarea></div>
           <p v-if="formError" class="community-error" role="alert">{{ formError }}</p>
-          <button class="community-btn w-100" :disabled="posting || (wallet && !canAfford)">{{ posting ? 'Posting…' : freeLeft ? 'Post request' : `Post request · ${wallet.extraRequestCost} credits` }}</button>
+          <button class="community-btn w-100" :disabled="posting">{{ posting ? 'Posting…' : 'Post request' }}</button>
         </fieldset>
       </form>
     </div>

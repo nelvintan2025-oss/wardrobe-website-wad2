@@ -67,6 +67,7 @@ test('Community and the latest business portal share requests and replies', asyn
     assert.equal(reply.status, 400); assert.match(reply.body.message, /no longer open/);
     assert.equal((await api(`/community/requests/${requestId}`)).body.responses.length, 1);
     const history = await api(`/community/members/${customer._id}`, 'business');
+    assert.equal(history.body.requestTotal, 1, 'signed-in businesses may see community request history');
     assert.equal(history.body.requests[0].status, 'closed');
     assert.deepEqual(Object.keys(history.body.member).sort(), ['id', 'name', 'role']);
   });

@@ -7,7 +7,7 @@ export default {
   data() {
     return {
       videos: [], activeIndex: 0, loading: true, error: '', interactionError: '',
-      likedBusy: '', muted: true, viewed: new Set(), impressed: new Set(), playbackProgress: {},
+      likedBusy: '', muted: true, lastImpressedPost: null, playbackProgress: {}, observedPlayback: {},
       // Native trackpad/wheel scrolling is never locked. Remember when the
       // final card was reached so only a NEW downward gesture loops it.
       scrollSettleTimer: null, lastWheelAt: 0, bottomReachedAt: 0,
@@ -41,9 +41,9 @@ export default {
         const data = await styleFeedApi(previousFirst ? `?avoidFirst=${encodeURIComponent(previousFirst)}` : '')
         this.videos = data.videos
         this.activeIndex = 0
-        this.viewed = new Set()
-        this.impressed = new Set()
+        this.lastImpressedPost = null
         this.playbackProgress = {}
+        this.observedPlayback = {}
         this.lastWheelAt = 0
         this.bottomReachedAt = 0
         try {
@@ -72,10 +72,12 @@ export default {
         video.muted = this.muted
         video.play().catch(() => {}) // Browsers may require a gesture for autoplay.
       }
-      if (post.boosted && !this.impressed.has(post.videoId)) {
-        this.impressed.add(post.videoId)
+      // Entering a sponsored post again is a new exposure. The API enforces
+      // the 10-impression cap per account and paid campaign.
+      if (post.boosted && this.lastImpressedPost !== post.videoId) {
         void this.track(post.videoId, 'impression')
       }
+      this.lastImpressedPost = post.videoId
     },
     navigate(direction) {
       if (this.loading || !this.videos.length) return
@@ -183,8 +185,26 @@ export default {
         this.playbackProgress[post.videoId] = Math.max(0, Math.min(100,
           video.currentTime / video.duration * 100))
       }
-      if (video.currentTime < 2 || this.viewed.has(post.videoId)) return
-      this.viewed.add(post.videoId)
+      // Count actual playback rather than elapsed position. Seeking directly to
+      // 50% must not register a view without watching any of the clip.
+      const record = this.observedPlayback[post.videoId] || { lastTime: 0, watched: 0, countedThisPlay: false }
+      // HTML5 loop rewinds a video automatically, without firing `ended`.
+      // Count each newly watched playback once; rewinding via seek isn't a new play.
+      if (!video.seeking && Number.isFinite(video.duration) && video.duration > 0 &&
+          video.currentTime < record.lastTime - 0.25 &&
+          record.lastTime >= Math.max(video.duration * 0.65, video.duration - 1.5)) {
+        record.watched = 0
+        record.countedThisPlay = false
+      }
+      const diff = video.currentTime - record.lastTime
+      if (!video.seeking && !video.paused && diff > 0 && diff <= 1.5) record.watched += diff
+      record.lastTime = video.currentTime
+      this.observedPlayback[post.videoId] = record
+      const threshold = Number.isFinite(video.duration) && video.duration > 0
+        ? Math.min(2, video.duration / 2) : 2
+      if (record.watched < threshold || record.countedThisPlay) return
+      record.countedThisPlay = true
+
       void this.track(post.videoId, 'view')
     },
     seekVideo(index, event) {
@@ -193,6 +213,10 @@ export default {
       if (!video || !post || !Number.isFinite(video.duration) || video.duration <= 0) return
       const percent = Math.max(0, Math.min(100, Number(event.target.value) || 0))
       video.currentTime = video.duration * percent / 100
+      // Seeking changes the position, not the amount actually watched.
+      const record = this.observedPlayback[post.videoId] || { lastTime: 0, watched: 0, countedThisPlay: false }
+      record.lastTime = video.currentTime
+      this.observedPlayback[post.videoId] = record
       this.playbackProgress[post.videoId] = percent
     },
     togglePlayback(event) {
@@ -201,7 +225,13 @@ export default {
       else video.pause()
     },
     async track(id, type) {
-      try { await styleFeedApi(`/${id}/event`, { method: 'POST', body: JSON.stringify({ type }) }) }
+      try {
+        const result = await styleFeedApi(`/${id}/event`, { method: 'POST', body: JSON.stringify({ type }) })
+        if (type === 'view' && result.counted) {
+          const post = this.videos.find(video => video.videoId === id)
+          if (post) post.views = (post.views || 0) + 1
+        }
+      }
       catch (error) { this.interactionError = `Some viewing statistics could not be saved: ${error.message}` }
     },
     openProduct(post) {
@@ -270,6 +300,7 @@ export default {
             <div class="sf-video-caption"><strong>{{ post.businessName }}</strong><p>{{ post.caption }}</p></div>
             <div class="sf-video-actions">
               <button type="button" :disabled="likedBusy === post.videoId" :aria-label="post.liked ? 'Unlike' : 'Like'" :aria-pressed="post.liked" @click="toggleLike(post)"><span>{{ post.liked ? '♥' : '♡' }}</span><small>{{ post.likes }}</small></button>
+              <span class="sf-view-count" :aria-label="`${post.views || 0} video views`"><span aria-hidden="true">▶</span><small>{{ post.views || 0 }}</small></span>
             </div>
             <input class="sf-video-progress" type="range" min="0" max="100" step="0.1"
               :value="playbackProgress[post.videoId] || 0"
@@ -286,6 +317,7 @@ export default {
                 <strong :title="post.productName">{{ post.productName }}</strong>
                 <span class="sf-product-business">{{ post.businessName }}</span>
                 <span class="sf-product-price">{{ formatMoney(post.productPrice) }}</span>
+                <span v-if="!post.productAvailable" class="sf-sold-out">Sold out · video still available</span>
               </div>
             </div>
             <div class="sf-product-links">

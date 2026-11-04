@@ -2,6 +2,9 @@ const mongoose = require('mongoose');
 const { badRequest, singaporeToday } = require('../communityValidation');
 const rules = require('../businessValidation');
 const { listedColours } = require('../services/listedColours');
+const { imageFor, resolveColourPhotos } = require('../services/colourPhotos');
+const { sizeStockMap } = require('../services/sizeStock');
+const { syncProductBoosts, remainingBoostMs } = require('../services/styleBoostAvailability');
 
 const defaultModels = {
   Business: require('../models/Business'),
@@ -10,7 +13,8 @@ const defaultModels = {
   SkipFeedback: require('../models/SkipFeedback'),
   Request: require('../models/OutfitRequest'),
   Response: require('../models/RequestResponse'),
-  User: require('../models/User')
+  User: require('../models/User'),
+  StyleVideo: require('../models/StyleVideo')
 };
 
 function failure(status, message) { const error = new Error(message); error.status = status; return error; }
@@ -65,24 +69,27 @@ function productJson(doc) {
   return {
     productId: String(doc._id), businessId: doc.businessId, businessName: doc.businessName,
     name: doc.name, price: doc.price, style: doc.style, category: doc.category,
-    occasions: doc.occasions, sizes: doc.sizes, stock: doc.stock, description: doc.description,
+    occasions: doc.occasions, sizes: doc.sizes, stock: doc.stock, sizeStock: sizeStockMap(doc), description: doc.description,
     colours, colour: colours.length === 1 ? colours[0] : null, material: doc.material || null,
     availableColours: colours,
+    colourImages: Object.fromEntries((doc.colourPhotos || []).filter(row => colours.includes(row.colour))
+      .map(row => [row.colour, `/api/catalog/products/${doc._id}/colour-image/${encodeURIComponent(row.colour)}`])),
     status: doc.status, boosted: doc.boosted, boostedUntil: doc.boostedUntil || null,
     premium: doc.premium, premiumUntil: doc.premiumUntil || null, views: doc.views,
-    imageURL: `/api/catalog/products/${doc._id}/image`, createdAt: doc.createdAt
+    imageURL: `/api/catalog/products/${doc._id}/image`, sizeImageURL: doc.sizePhoto?.contentType ? `/api/catalog/products/${doc._id}/size-image` : null, createdAt: doc.createdAt
   };
 }
 function requestJson(doc) {
   return {
     requestId: String(doc._id), consumerName: doc.consumerName, title: doc.title, occasion: doc.occasion,
     description: doc.description, budget: doc.budget, preferredStyle: doc.preferredStyle,
-    deadline: doc.deadline, status: doc.status, createdAt: doc.createdAt
+    deadline: doc.deadline, status: doc.status, createdAt: doc.createdAt,
+    expired: !!doc.expiredAt, fulfilled: !!doc.purchaseId
   };
 }
 
 function createBusinessController(models = defaultModels) {
-  const { Business, Product, CoinTransaction, SkipFeedback, Request, Response, User } = models;
+  const { Business, Product, CoinTransaction, SkipFeedback, Request, Response, User, StyleVideo } = models;
 
   // Promotions last 7 days. Switch off any that have run out before reading products.
   async function expirePromotions(filter = {}) {
@@ -158,7 +165,8 @@ function createBusinessController(models = defaultModels) {
 
   async function createProduct(req, res) {
     let business = await myBusiness(req);
-    const input = rules.productInput(req.body, { photoRequired: true });
+    const { colourPhotoUploads, ...input } = rules.productInput(req.body, { photoRequired: true });
+    Object.assign(input, resolveColourPhotos({ colours: input.colours, photo: input.photo, uploads: colourPhotoUploads }));
     // The first few listings are free. Each one after that costs coins.
     const count = await Product.countDocuments({ businessId: String(business._id) });
     const product = new Product({ ...input, businessId: String(business._id), businessName: business.businessName });
@@ -173,17 +181,32 @@ function createBusinessController(models = defaultModels) {
 
   async function updateProduct(req, res) {
     const business = await myBusiness(req);
-    const product = await myProduct(req, business);
-    const input = rules.productInput(req.body, { photoRequired: false });
+    if (!idIsValid(req.params.id)) throw failure(404, 'Product not found.');
+    const product = await Product.findOne({ _id: req.params.id, businessId: String(business._id) }).select('+photo.data +colourPhotos.data');
+    if (!product) throw failure(404, 'Product not found.');
+    const { colourPhotoUploads, ...input } = rules.productInput(req.body, { photoRequired: false });
+    Object.assign(input, resolveColourPhotos({ colours: input.colours, photo: input.photo, uploads: colourPhotoUploads }, product));
     if (!input.photo) delete input.photo;
+    if (!input.sizePhoto) delete input.sizePhoto;
+    const wasAvailable = product.status === 'active';
     product.set(input);
     await product.save();
+    const isAvailable = product.status === 'active';
+    if (StyleVideo && wasAvailable !== isAvailable) {
+      await syncProductBoosts(StyleVideo, product._id, isAvailable);
+    }
     res.json({ product: productJson(product) });
   }
 
   async function deleteProduct(req, res) {
     const business = await myBusiness(req);
     const product = await myProduct(req, business);
+    if (StyleVideo) {
+      const videos = await StyleVideo.find({ productId: String(product._id), boostedUntil: { $ne: null } });
+      if (videos.some(video => remainingBoostMs(video) > 0)) {
+        throw failure(409, 'This product has unused paid Style Feed promotion time. Hide it instead of deleting it.');
+      }
+    }
     await Product.deleteOne({ _id: product._id });
     res.json({ message: 'Product deleted.' });
   }
@@ -301,6 +324,8 @@ function createBusinessController(models = defaultModels) {
   // ---------- Request board (reads Person 3's outfit requests) ----------
   async function getRequests(req, res) {
     const business = await myBusiness(req);
+    await Request.updateMany({ deletedAt: null, status: 'open', acceptedResponseId: null, deadline: { $lt: singaporeToday() } },
+      { $set: { status: 'closed', expiredAt: new Date() } });
     // The business inbox has two distinct lists:
     //   open    — requests awaiting this business's first suggestion
     //   replied — every non-deleted request this business has responded to,
@@ -318,6 +343,8 @@ function createBusinessController(models = defaultModels) {
     else if (req.query.myStyles === 'true') filter.preferredStyle = { $in: business.styles };
     const search = queryText(req.query.search);
     if (search) filter.title = { $regex: escapeRegex(search), $options: 'i' };
+    const targetId = queryText(req.query.requestId, 30);
+    if (targetId && !idIsValid(targetId)) throw badRequest('Choose a valid request.');
 
     if (tab) {
       // Query by the business that SENT the reply, not merely the request's
@@ -329,6 +356,7 @@ function createBusinessController(models = defaultModels) {
         ? { $in: repliedIds }
         : { $nin: repliedIds };
     }
+    if (targetId) filter._id = { ...(filter._id || {}), $eq: targetId };
     const page = pageNumber(req.query.page), pageSize = 12;
     const [items, total] = await Promise.all([
       Request.find(filter).sort({ createdAt: -1, _id: -1 }).skip((page - 1) * pageSize).limit(pageSize),
@@ -394,6 +422,8 @@ function createBusinessController(models = defaultModels) {
       const value = queryText(req.query[field]);
       if (value) filter[field] = value;
     }
+    const size = queryText(req.query.size);
+    if (size) filter.sizes = { $regex: `^${escapeRegex(size)}$`, $options: 'i' };
     const occasion = queryText(req.query.occasion);
     if (occasion) filter.occasions = { $regex: `^${escapeRegex(occasion)}$`, $options: 'i' };
     const search = queryText(req.query.search);
@@ -412,7 +442,14 @@ function createBusinessController(models = defaultModels) {
     if (req.query.forYou === 'true' && prefs) {
       const skipped = await SkipFeedback.find({ userId: req.user.id });
       if (skipped.length) filter._id = { $nin: skipped.map(skip => skip.productId).filter(idIsValid) };
-      const all = await Product.find(filter);
+      const forYouFilter = { ...filter };
+      if (prefs.activities?.length) {
+        forYouFilter.occasions = { $in: prefs.activities.map(activity => new RegExp(`^${escapeRegex(activity)}$`, 'i')) };
+      }
+      if (prefs.budget) {
+        forYouFilter.price = { ...(forYouFilter.price || {}), $lte: prefs.budget };
+      }
+      const all = await Product.find(forYouFilter);
       const ranked = all.map(product => ({ product, ...matchFor(product, prefs) }))
         .sort((a, b) => b.score - a.score || b.product.createdAt - a.product.createdAt);
       const slice = ranked.slice((page - 1) * pageSize, page * pageSize);
@@ -500,6 +537,27 @@ function createBusinessController(models = defaultModels) {
     res.type(product.photo.contentType).send(product.photo.data);
   }
 
+
+  async function getProductColourImage(req, res) {
+    if (!idIsValid(req.params.id)) throw failure(404, 'Photo not found.');
+    const product = await Product.findById(req.params.id).select('+photo.data +colourPhotos.data');
+    const row = product?.colourPhotos?.find(entry => entry.colour === req.params.colour);
+    const image = row && imageFor(row, product.photo);
+    if (!image) throw failure(404, 'Photo not found.');
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('Cache-Control', 'private, max-age=300');
+    res.type(image.contentType).send(image.data);
+  }
+
+  async function getProductSizeImage(req, res) {
+    if (!idIsValid(req.params.id)) throw failure(404, 'Size guide not found.');
+    const product = await Product.findById(req.params.id).select('+sizePhoto.data');
+    if (!product?.sizePhoto?.data) throw failure(404, 'Size guide not found.');
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('Cache-Control', 'private, max-age=300');
+    res.type(product.sizePhoto.contentType).send(product.sizePhoto.data);
+  }
+
   async function getBusinessLogo(req, res) {
     if (!idIsValid(req.params.id)) throw failure(404, 'Logo not found.');
     const business = await Business.findById(req.params.id).select('+logo.data');
@@ -513,7 +571,7 @@ function createBusinessController(models = defaultModels) {
     getProfile, saveProfile, getMyProducts, getMyProduct, createProduct, updateProduct, deleteProduct,
     getWallet, purchaseCoins, boostProduct: promote('boost'), premiumProduct: promote('premium'),
     getDashboard, getRequests, respondToRequest,
-    getCatalog, getCatalogBusiness, getCatalogProduct, skipProduct, getProductImage, getBusinessLogo
+    getCatalog, getCatalogBusiness, getCatalogProduct, skipProduct, getProductImage, getProductColourImage, getProductSizeImage, getBusinessLogo
   };
 }
 

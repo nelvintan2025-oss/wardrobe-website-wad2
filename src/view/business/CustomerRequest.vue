@@ -2,12 +2,14 @@
 import { businessApi, sendJson, money, shortDate, bestProduct } from '../../services/businessApi'
 import { readableDate, today } from '../../services/communityApi'
 import BusinessIcon from '../../components/BusinessIcon.vue'
+import ReportDialog from '../../components/ReportDialog.vue'
 export default {
-  components: { BusinessIcon },
+  components: { BusinessIcon, ReportDialog },
   data() {
     return { openRequests: [], repliedRequests: [], totals: { open: 0, replied: 0 }, pages: { open: 1, replied: 1 }, products: [], loading: true, loadingMore: false, error: '', needsProfile: false,
-      tab: 'open', search: this.$route.query.search || '', selectedId: this.$route.query.request || '',
-      drafts: {}, pickerOpen: false, sending: false, sendError: '', sentNotice: '' }
+      tab: 'open', search: this.$route.query.search || '', selectedId: this.$route.query.request || '', linkedRequestId: this.$route.query.request || '',
+      drafts: {}, pickerOpen: false, sending: false, sendError: '', sentNotice: '',
+        reportTarget: null }
   },
   computed: {
     openList() { return this.openRequests },
@@ -21,9 +23,10 @@ export default {
   },
   watch: {
     '$route.query.search'(value) { this.search = value || ''; this.load() },
-    '$route.query.request'(value) { if (value) this.selectedId = value },
+    '$route.query.request'(value) { this.linkedRequestId = value || ''; if (value) { this.selectedId = value; this.load() } },
   },
   async mounted() {
+    this.refreshTimer = setInterval(() => { if (!document.hidden && !this.loading && !this.sending && !this.loadingMore) this.refresh() }, 20000)
     window.addEventListener('focus', this.refresh)
     document.addEventListener('visibilitychange', this.refresh)
     try { this.products = (await businessApi('/products')).products.filter(p => p.status === 'active' && p.stock > 0) }
@@ -31,19 +34,20 @@ export default {
     await this.load()
     if (this.selectedId && this.repliedList.some(r => r.requestId === this.selectedId)) this.tab = 'replied'
   },
-  beforeUnmount() { window.removeEventListener('focus', this.refresh); document.removeEventListener('visibilitychange', this.refresh) },
+  beforeUnmount() { clearInterval(this.refreshTimer); window.removeEventListener('focus', this.refresh); document.removeEventListener('visibilitychange', this.refresh) },
   methods: {
     money, shortDate, readableDate,
     requestState(request) {
+      if (request.fulfilled && request.acceptedResponseId && request.myResponses.some(reply => reply.responseId === request.acceptedResponseId)) return 'Purchased'
       if (request.acceptedResponseId && request.myResponses.some(reply => reply.responseId === request.acceptedResponseId)) return 'Accepted'
+      if (request.expired || (request.status === 'open' && request.deadline < today())) return 'Expired'
       if (request.status === 'closed') return 'Closed'
-      if (request.deadline < today()) return 'Expired'
       return request.myResponses.length ? 'Replied' : 'Open'
     },
     async refresh() {
       if (this.sending || document.hidden) return
       this.error = ''
-      try { this.products = (await businessApi('/products')).products.filter(p => p.status === 'active' && p.stock > 0); await this.load() }
+      try { this.products = (await businessApi('/products')).products.filter(p => p.status === 'active' && p.stock > 0); await this.load({ preservePages: true }) }
       catch (error) { this.error = error.message }
     },
     initial(name) { return (name || 'C').charAt(0).toUpperCase() },
@@ -51,27 +55,61 @@ export default {
       for (const request of list) {
         if (this.drafts[request.requestId]) continue
         const product = bestProduct(this.products, request)
-        const fits = product && product.price <= request.budget
-        this.drafts[request.requestId] = { productId: product?.productId || '',
-          message: product ? `Hi ${request.consumerName}, our ${product.name.toLowerCase()} ${fits ? 'fits your budget and ' : ''}would work well for your ${request.occasion.toLowerCase()}.` : '' }
+        this.drafts[request.requestId] = { productId: product?.productId || '', message: this.suggestedMessage(request, product) }
       }
+    },
+    suggestedMessage(request, product) {
+      if (!product) return ''
+      const fits = product.price <= request.budget
+      return `Hi ${request.consumerName}, our ${product.name.toLowerCase()} ${fits ? 'fits your budget and ' : ''}would work well for your ${request.occasion.toLowerCase()}.`
     },
     async fetchPage(tab, page) {
       const query = new URLSearchParams({ tab, page })
       if (this.search) query.set('search', this.search)
       return businessApi(`/requests?${query}`)
     },
-    async load() {
+    async load({ preservePages = false } = {}) {
       this.loading = true; this.error = ''
       try {
-        // Both tabs have independent server-side pagination. Previously,
-        // Replied was derived from the first page of open requests and lost
-        // closed/accepted items as soon as the customer finished.
-        const [open, replied] = await Promise.all([this.fetchPage('open', 1), this.fetchPage('replied', 1)])
+        // Auto-refresh must retain expanded history, not send a business back
+        // to the first page every 20 seconds. A new search resets pagination.
+        const fetchLoaded = async tab => {
+          const count = preservePages ? Math.max(1, this.pages[tab]) : 1
+          const responses = await Promise.all(Array.from({ length: count }, (_, n) => this.fetchPage(tab, n + 1)))
+          const first = responses[0]
+          const seen = new Set()
+          const requests = responses.flatMap(result => result.requests).filter(item => {
+            if (seen.has(item.requestId)) return false
+            seen.add(item.requestId)
+            return true
+          })
+          return { requests, total: first.total, page: Math.min(count, Math.max(1, Math.ceil(first.total / 12))) }
+        }
+        const [open, replied] = await Promise.all([fetchLoaded('open'), fetchLoaded('replied')])
         this.openRequests = open.requests; this.repliedRequests = replied.requests
         this.totals = { open: open.total, replied: replied.total }
-        this.pages = { open: 1, replied: 1 }
+        this.pages = { open: open.page, replied: replied.page }
         this.prepare([...open.requests, ...replied.requests])
+        // The dashboard can point to a request on page 2+ of either tab.
+        // Fetch only that request (server still enforces business visibility).
+        const linkedId = this.linkedRequestId
+        if (linkedId && ![...this.openList, ...this.repliedList].some(r => r.requestId === linkedId)) {
+          const [targetOpen, targetReplied] = await Promise.all([
+            businessApi(`/requests?${new URLSearchParams({ tab: 'open', requestId: linkedId })}`),
+            businessApi(`/requests?${new URLSearchParams({ tab: 'replied', requestId: linkedId })}`),
+          ])
+          const target = targetOpen.requests[0] || targetReplied.requests[0]
+          if (target) {
+            const list = targetOpen.requests.length ? this.openRequests : this.repliedRequests
+            if (!list.some(r => r.requestId === linkedId)) list.unshift(target)
+            this.prepare([target])
+          } else {
+            this.linkedRequestId = ''
+            this.error = 'That request is no longer available in your inbox.'
+          }
+        }
+        if (linkedId && this.openList.some(r => r.requestId === linkedId)) this.tab = 'open'
+        else if (linkedId && this.repliedList.some(r => r.requestId === linkedId)) this.tab = 'replied'
         if (this.selectedId && !this.visible.some(r => r.requestId === this.selectedId)) {
           const other = this.tab === 'open' ? this.repliedList : this.openList
           if (other.some(r => r.requestId === this.selectedId)) this.tab = this.tab === 'open' ? 'replied' : 'open'
@@ -96,7 +134,12 @@ export default {
     },
     setTab(tab) { this.tab = tab; this.selectedId = this.visible[0]?.requestId || ''; this.sentNotice = ''; this.pickerOpen = false },
     select(request) { this.selectedId = request.requestId; this.pickerOpen = false; this.sendError = ''; this.sentNotice = '' },
-    choose(product) { this.draft.productId = product.productId; this.pickerOpen = false },
+    choose(product) {
+      // Person 4: swap the ready-made message to the new product, unless the business already wrote their own.
+      const message = this.draft.message.trim()
+      if (!message || message === this.suggestedMessage(this.selected, this.chosenProduct)) this.draft.message = this.suggestedMessage(this.selected, product)
+      this.draft.productId = product.productId; this.pickerOpen = false
+    },
     async send() {
       const request = this.selected
       if (!this.canReply || !this.draft?.productId || !this.draft.message.trim() || this.sending) return
@@ -123,7 +166,7 @@ export default {
 </script>
 <template>
   <section aria-labelledby="biz-requests-heading">
-    <div class="biz-page-head"><div><h1 id="biz-requests-heading">Meet a customer’s next outfit</h1><p>Respond to requests that match your collection.</p></div><button type="button" class="biz-btn biz-btn-outline" :disabled="loading || sending" @click="refresh">Refresh requests</button></div>
+    <div class="biz-page-head"><div><h1 id="biz-requests-heading">Meet a customer’s next outfit</h1><p>Respond to requests that match your collection.</p></div></div>
     <div v-if="needsProfile" class="biz-empty"><h2>Set up your business first</h2><RouterLink :to="{ name: 'business-profile' }" class="biz-btn">Set up profile</RouterLink></div>
     <template v-else>
       <div v-if="error" class="biz-error" role="alert">{{ error }} <button @click="load">Try again</button></div>
@@ -156,7 +199,34 @@ export default {
             <div><strong>{{ selected.consumerName }}</strong><span class="biz-pill" :class="selected.myResponses.length ? 'green' : 'yellow'">{{ requestState(selected) }}</span>
               <div class="biz-muted">Requested on {{ shortDate(selected.createdAt) }} · {{ selected.responseCount }} {{ selected.responseCount === 1 ? 'reply' : 'replies' }} so far</div></div>
           </div>
-          <h2>{{ selected.title }}</h2>
+          <div class="request-title-row">
+            <h2>{{ selected.title }}</h2>
+
+            <button
+              type="button"
+              class="request-report-button"
+              title="Report request"
+              :aria-label="`Report outfit request: ${selected.title}`"
+              @click="reportTarget = {
+                id: selected.requestId,
+                title: selected.title
+              }"
+            >
+              <svg
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M5 21V3m0 1c5-4 9 4 14 0v10c-5 4-9-4-14 0" />
+              </svg>
+            </button>
+          </div>
           <p class="biz-request-desc">{{ selected.occasion }}. {{ selected.description }}</p>
           <div class="biz-request-facts">
             <div><BusinessIcon name="coins" :size="28" /><span><strong>{{ money(selected.budget) }}</strong><small>Budget</small></span></div>
@@ -201,6 +271,51 @@ export default {
         </article>
         <div v-else-if="!loading" class="biz-request-detail biz-muted text-center">Choose a request to see the details.</div>
       </div>
-    </template>
+        </template>
+
+    <ReportDialog
+      v-if="reportTarget"
+      :listing-id="reportTarget.id"
+      :listing-name="reportTarget.title"
+      target-type="request"
+      @close="reportTarget = null"
+    />
   </section>
 </template>
+
+<style scoped>
+.request-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.request-title-row h2 {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.request-report-button {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 1px solid #e5dfe3;
+  border-radius: 50%;
+  background: #fffdfa;
+  color: #6b3a55;
+  cursor: pointer;
+}
+
+.request-report-button:hover {
+  background: #f6e8ef;
+}
+
+.request-report-button:focus-visible {
+  outline: 2px solid #683760;
+  outline-offset: 3px;
+}
+</style>

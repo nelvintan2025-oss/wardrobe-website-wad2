@@ -50,12 +50,15 @@ export default {
       try {
         await styleFeedApi(`/${post.videoId}/boost`, { method: 'POST', body: '{}' })
         await Promise.all([this.load(), refreshBusiness()])
-        this.success = 'Your boost is active. Open Style Feed to see the Sponsored placement.'
+        this.success = 'Boost active. Sponsored placements rotate when the feed refreshes. A sold-out product keeps its video visible; hiding the product pauses unused promotion time.'
       } catch (error) { this.error = error.message }
       finally { this.busy = '' }
     },
     async remove(post) {
-      if (!window.confirm('Delete this video permanently?')) return
+      const message = post.boostRemainingMs > 0
+        ? 'Delete this video permanently? Its paid boost will end immediately, and its video statistics will be removed. Any remaining promotion time and coins spent will not be refunded.'
+        : 'Delete this video permanently?'
+      if (!window.confirm(message)) return
       this.busy = post.videoId; this.error = ''; this.success = ''
       try { await styleFeedApi(`/${post.videoId}`, { method: 'DELETE' }); this.success = 'Video deleted.'; await this.load() }
       catch (error) { this.error = error.message }
@@ -66,7 +69,7 @@ export default {
 </script>
 <template>
   <section class="sf-manager">
-    <div class="biz-page-head"><div><span class="sf-eyebrow">Business creator tools</span><h1>Style Feed studio</h1><p>Show your outfits in motion. Every video links to one of your existing products.</p></div><RouterLink :to="{ name: 'style-feed' }" class="biz-btn">Watch Style Feed →</RouterLink></div>
+    <div class="biz-page-head"><div><span class="sf-eyebrow">Business creator tools</span><h1>Style Feed studio</h1><p>Show your outfits in motion. Every video links to one of your existing products.</p></div></div>
     <p v-if="loading" role="status">Loading your creator studio…</p>
     <p v-if="error" role="alert" class="biz-error">{{ error }}</p>
     <p v-if="success" role="status" class="biz-success">{{ success }}</p>
@@ -84,17 +87,28 @@ export default {
           <video v-if="videoPreview" class="sf-upload-preview" :src="videoPreview" controls playsinline muted />
           <button type="submit" class="biz-btn biz-btn-pink" :disabled="uploading || !availableProducts.length">{{ uploading ? 'Publishing…' : 'Publish to Style Feed' }}</button>
         </form>
-        <aside class="biz-card sf-promo-explainer"><span class="sf-eyebrow">Coin-powered promotion</span><h2>Give your best looks a boost</h2><strong class="sf-coins">{{ coins }} coins</strong><p>Your first upload is free. Boost any video for <strong>{{ boostCoins }} coins / {{ days }} days</strong>.</p><p>Videos are shuffled every time the feed loads. Boosted posts appear in a sponsored slot after every three regular videos, labelled “Sponsored”.</p><RouterLink :to="{ name: 'business-promotions' }" class="biz-btn">Top up demo coins →</RouterLink></aside>
+        <aside class="biz-card sf-promo-explainer"><span class="sf-eyebrow">Coin-powered promotion</span><h2>Give your best looks a boost</h2><strong class="sf-coins">{{ coins }} coins</strong><p>Video uploads are free. Boost any video for <strong>{{ boostCoins }} coins / {{ days }} days</strong>.</p><p>Videos are shuffled every time the feed loads. Boosted posts rotate through Sponsored slots after groups of three regular videos, labelled “Sponsored”. If there are more boosts than slots, some videos appear on a later refresh. Sold-out products remain visible in the feed for brand awareness, with shopping unavailable until restocked. Hiding a product pauses its remaining paid promotion time until the listing is restored.</p><RouterLink :to="{ name: 'business-promotions' }" class="biz-btn">Top up demo coins →</RouterLink></aside>
       </div>
       <div class="sf-management-head"><h2>My videos <small>({{ videos.length }})</small></h2><span>Performance updates from customer interactions.</span></div>
       <div v-if="!videos.length" class="biz-card sf-empty"><h3>Nothing posted yet</h3><p>Your first video will appear here after you publish it.</p></div>
       <div v-else class="sf-my-videos">
         <article v-for="post in videos" :key="post.videoId" class="biz-card sf-video-item">
           <video :src="post.videoURL" :poster="post.productImageURL" preload="metadata" controls muted playsinline />
-          <div class="sf-video-information"><strong>{{ post.productName }}</strong><p>{{ post.caption }}</p><span v-if="post.boosted" class="sf-live-boost">Sponsored until {{ shortDate(post.boostedUntil) }}</span><span v-else class="sf-organic-label">Organic post · free</span>
+          <div class="sf-video-information"><strong>{{ post.productName }}</strong><p>{{ post.caption }}</p><span v-if="post.boostPaused" class="sf-live-boost">Boost paused · {{ Math.ceil(post.boostRemainingMs / 86400000) }} day(s) remaining</span><span v-else-if="post.boosted" class="sf-live-boost">Sponsored until {{ shortDate(post.boostedUntil) }}</span><span v-else class="sf-organic-label">Organic post · free</span>
             <div class="sf-stats-grid"><div><strong>{{ post.sponsoredImpressions }}</strong><small>Sponsored impressions</small></div><div><strong>{{ post.uniqueReach }}</strong><small>Unique sponsored reach</small></div><div><strong>{{ post.views }}</strong><small>Views</small></div><div><strong>{{ post.likes }}</strong><small>Likes</small></div><div><strong>{{ post.productClicks }}</strong><small>Product clicks</small></div><div><strong>{{ post.storeClicks }}</strong><small>Store clicks</small></div></div>
-            <p v-if="!post.productAvailable" class="biz-muted small">This product is hidden or out of stock. Make it available before boosting the video.</p>
-            <div class="sf-item-actions"><button type="button" class="biz-btn biz-btn-pink" :disabled="busy !== '' || coins < boostCoins || !post.productAvailable" @click="boost(post)">{{ post.boosted ? 'Extend boost' : 'Boost video' }} · {{ boostCoins }} coins</button><button type="button" class="biz-btn" :disabled="busy !== ''" @click="remove(post)">Delete video</button></div>
+            <div v-if="post.sinceBoost" class="sf-boost-comparison">
+              <strong>Since your latest boost</strong>
+              <p class="biz-muted small mb-2">Change from the totals recorded when you spent coins on {{ shortDate(post.boostStartedAt) }}. These are observed changes, not guaranteed additional views caused by the boost.</p>
+              <div class="sf-stats-grid">
+                <div><strong>+{{ post.sinceBoost.views }}</strong><small>Views</small></div>
+                <div><strong>+{{ post.sinceBoost.sponsoredImpressions }}</strong><small>Sponsored impressions</small></div>
+                <div><strong>{{ post.sinceBoost.uniqueReach }}</strong><small>Unique reach this boost</small></div>
+                <div><strong>+{{ post.sinceBoost.productClicks }}</strong><small>Product clicks</small></div>
+                <div><strong>+{{ post.sinceBoost.storeClicks }}</strong><small>Store clicks</small></div>
+              </div>
+            </div>
+            <p v-if="!post.productListed" class="biz-muted small">This product is hidden. The video is not in the public feed and unused promotion time is paused.</p><p v-else-if="!post.productAvailable" class="biz-muted small">Sold out · video stays in the Style Feed for discovery. Customers can view the listing but cannot purchase until restocked.</p>
+            <div class="sf-item-actions"><button type="button" class="biz-btn biz-btn-pink" :disabled="busy !== '' || coins < boostCoins || !post.productAvailable" @click="boost(post)">{{ post.boosted ? 'Extend boost' : 'Boost video' }} · {{ boostCoins }} coins</button><button type="button" class="biz-btn" :disabled="busy !== ''" title="Delete video" @click="remove(post)">Delete video</button></div>
           </div>
         </article>
       </div>

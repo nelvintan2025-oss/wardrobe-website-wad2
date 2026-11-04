@@ -1,45 +1,103 @@
 <script>
-import { businessApi, sendJson, readPhoto, categories, styles, occasions } from '../../services/businessApi'
+import { businessApi, sendJson, readPhoto, readColourPhoto, categories, styles, occasions } from '../../services/businessApi'
 import { colours } from '../../services/wardrobeService'
 import { refreshBusiness } from '../../services/businessStore'
 import BusinessIcon from '../../components/BusinessIcon.vue'
-const blank = () => ({ name: '', price: '', style: '', category: '', colours: [], material: '', occasions: [], sizes: '', stock: '', description: '', status: 'active' })
+// Person 4: each size has its own stock. `sizeRows` is the list the business edits.
+const blank = () => ({ name: '', price: '', style: '', category: '', colours: [], material: '', occasions: [], sizeRows: [{ size: '', stock: '' }], description: '', status: 'active' })
+const QUICK_SIZES = ['XS', 'S', 'M', 'L', 'XL', 'XXL', 'One size']
+// Shoes only use US number sizes.
+const QUICK_SHOE_SIZES = ['5', '6', '7', '8', '9', '10', '11', '12', '13']
+const SHOE_SIZE = /^(?:[1-9]|1\d|20)(?:\.5)?$/
+const MAX_COLOURS = 6
 export default {
   components: { BusinessIcon },
-  data() { return { categories, colours, styles, occasions, form: blank(), photo: '', photoPreview: '', loading: false, saving: false, error: '' } },
+  data() { return { categories, colours, styles, occasions, form: blank(), legacyStock: null, photo: '', photoPreview: '', colourUploads: {}, savedColourImages: {}, sizePhoto: '', sizePhotoPreview: '', loading: false, saving: false, error: '' } },
   computed: {
     productId() { return this.$route.params.productId },
     editing() { return Boolean(this.productId) },
+    isShoes() { return this.form.category === 'Shoes' },
+    quickSizes() { return this.isShoes ? QUICK_SHOE_SIZES : QUICK_SIZES },
+    multiColour() { return this.form.colours.length > 1 },
+    totalStock() { return this.form.sizeRows.reduce((sum, row) => sum + (Number(row.stock) || 0), 0) },
   },
   watch: { productId: { immediate: true, handler() { this.load() } } },
   methods: {
     async load() {
-      this.form = blank(); this.photo = ''; this.photoPreview = ''; this.error = ''
+      this.form = blank(); this.legacyStock = null; this.photo = ''; this.photoPreview = ''; this.colourUploads = {}; this.savedColourImages = {}; this.sizePhoto = ''; this.sizePhotoPreview = ''; this.error = ''
       if (!this.editing) return
       this.loading = true
       try {
         const { product } = await businessApi(`/products/${encodeURIComponent(this.productId)}`)
         this.form = { name: product.name, price: product.price, style: product.style, category: product.category, colours: [...(product.colours?.length ? product.colours : product.availableColours?.length ? product.availableColours : product.colour ? [product.colour] : [])], material: product.material || '', occasions: [...product.occasions],
-          sizes: product.sizes.join(', '), stock: product.stock, description: product.description, status: product.status }
-        this.photoPreview = product.imageURL
+          sizeRows: product.sizeStock
+            ? Object.entries(product.sizeStock).map(([size, stock]) => ({ size, stock }))
+            // Older listing: one stock shared by all sizes. Ask for each size's stock.
+            : product.sizes.map(size => ({ size, stock: '' })),
+          description: product.description, status: product.status }
+        if (!product.sizeStock) this.legacyStock = product.stock
+        if (!this.form.sizeRows.length) this.form.sizeRows = [{ size: '', stock: '' }]
+        this.photoPreview = product.imageURL; this.savedColourImages = product.colourImages || {}; this.sizePhotoPreview = product.sizeImageURL || ''
       } catch (error) { this.error = error.message }
       finally { this.loading = false }
     },
+    hasSize(size) { return this.form.sizeRows.some(row => row.size.trim().toLowerCase() === size.toLowerCase()) },
+    addSize(size = '') {
+      if (size && this.hasSize(size)) return
+      // Fill the first empty row before adding a new one.
+      const empty = size && this.form.sizeRows.find(row => !row.size.trim())
+      if (empty) empty.size = size
+      else if (this.form.sizeRows.length < 12) this.form.sizeRows.push({ size, stock: '' })
+    },
+    removeSize(index) {
+      this.form.sizeRows.splice(index, 1)
+      if (!this.form.sizeRows.length) this.form.sizeRows.push({ size: '', stock: '' })
+    },
+    // The first colour can reuse the main photo when no colour photos were saved yet.
+    colourPreview(colour) {
+      const isFirst = colour === this.form.colours[0]
+      if (this.colourUploads[colour]) return this.colourUploads[colour]
+      if (isFirst && this.photo) return this.photo
+      if (this.savedColourImages[colour]) return this.savedColourImages[colour]
+      return isFirst && !Object.keys(this.savedColourImages).length ? this.photoPreview : ''
+    },
+    async chooseColourPhoto(colour, event) {
+      const file = event.target.files[0]
+      this.error = ''
+      if (!file) return
+      try { this.colourUploads = { ...this.colourUploads, [colour]: await readColourPhoto(file) } }
+      catch (error) { this.error = error.message; event.target.value = '' }
+    },
+    async chooseSizePhoto(event) { const file=event.target.files[0]; this.error=''; if(!file)return; try{this.sizePhoto=await readPhoto(file);this.sizePhotoPreview=this.sizePhoto}catch(error){this.error=error.message;event.target.value=''} },
     async choosePhoto(event) {
       const file = event.target.files[0]
       this.error = ''
       if (!file) return
-      try { this.photo = await readPhoto(file); this.photoPreview = this.photo }
+      try { this.photo = await readPhoto(file); this.photoPreview = this.photo; this.colourUploads = {} }
       catch (error) { this.error = error.message; event.target.value = '' }
     },
     async save() {
       if (this.saving || !this.$refs.form.reportValidity()) return
       if (!this.form.colours.length) { this.error = 'Choose at least one available colour.'; return }
       if (!this.form.occasions.length) { this.error = 'Choose at least one occasion.'; return }
-      if (!this.editing && !this.photo) { this.error = 'Please choose a product photo.'; return }
+      if (this.form.colours.length > MAX_COLOURS) { this.error = `Choose up to ${MAX_COLOURS} colours.`; return }
+      if (this.multiColour) {
+        const missing = this.form.colours.find(colour => !this.colourPreview(colour))
+        if (missing) { this.error = `Add a photo for ${missing}.`; return }
+      } else if (!this.editing && !this.photo && !this.colourUploads[this.form.colours[0]]) { this.error = 'Please choose a product photo.'; return }
+      if (this.isShoes) {
+        const wrong = this.form.sizeRows.find(row => !SHOE_SIZE.test(row.size.trim()))
+        if (wrong) { this.error = `Shoes use US number sizes like 9 or 9.5, not "${wrong.size.trim()}".`; return }
+      }
+      const names = this.form.sizeRows.map(row => row.size.trim().toLowerCase())
+      if (new Set(names).size !== names.length) { this.error = 'Each size can only be listed once.'; return }
       this.saving = true; this.error = ''
-      const body = { ...this.form, price: Number(this.form.price), stock: Number(this.form.stock),
-        sizes: this.form.sizes.split(',').map(size => size.trim()).filter(Boolean), photo: this.photo || undefined }
+      const { sizeRows, ...fields } = this.form
+      const body = { ...fields, price: Number(this.form.price),
+        sizeStock: sizeRows.map(row => ({ size: row.size.trim(), stock: Number(row.stock) })),
+        // Only send photos for colours that are still ticked.
+        colourPhotos: Object.fromEntries(Object.entries(this.colourUploads).filter(([colour]) => this.form.colours.includes(colour))),
+        photo: this.photo || undefined, sizePhoto: this.sizePhoto || undefined }
       try {
         if (this.editing) await businessApi(`/products/${encodeURIComponent(this.productId)}`, sendJson('PUT', body))
         else { await businessApi('/products', sendJson('POST', body)); await refreshBusiness() }
@@ -59,21 +117,35 @@ export default {
       <fieldset :disabled="saving" class="border-0 p-0 m-0">
         <div class="row g-4">
           <div class="col-lg-4">
-            <label for="product-photo" class="form-label">Photo <span v-if="!editing" aria-hidden="true">*</span></label>
-            <div class="biz-photo-box"><img v-if="photoPreview" :src="photoPreview" alt="Product photo preview" /><span v-else>No photo yet</span></div>
-            <input id="product-photo" type="file" accept="image/jpeg,image/png,image/webp" class="form-control mt-2" @change="choosePhoto" />
-            <p v-if="editing" class="biz-muted small mt-1">Leave empty to keep the current photo.</p>
+            <template v-if="multiColour">
+              <p class="form-label mb-1">Photo for each colour <span aria-hidden="true">*</span></p>
+              <p class="biz-muted small">Customers see the photo of the colour they choose. The first colour is the main photo.</p>
+              <div v-for="colour in form.colours" :key="colour" class="mb-3">
+                <label :for="`colour-photo-${colour}`" class="form-label">{{ colour }}</label>
+                <div class="biz-photo-box"><img v-if="colourPreview(colour)" :src="colourPreview(colour)" :alt="`${colour} photo preview`" /><span v-else>No photo yet</span></div>
+                <input :id="`colour-photo-${colour}`" type="file" accept="image/jpeg,image/png,image/webp" class="form-control mt-2" @change="chooseColourPhoto(colour, $event)" />
+              </div>
+            </template>
+            <template v-else>
+              <label for="product-photo" class="form-label">Photo <span v-if="!editing" aria-hidden="true">*</span></label>
+              <div class="biz-photo-box"><img v-if="colourPreview(form.colours[0]) || photoPreview" :src="colourPreview(form.colours[0]) || photoPreview" alt="Product photo preview" /><span v-else>No photo yet</span></div>
+              <input id="product-photo" type="file" accept="image/jpeg,image/png,image/webp" class="form-control mt-2" @change="choosePhoto" />
+              <p v-if="editing" class="biz-muted small mt-1">Leave empty to keep the current photo.</p>
+            </template>
+            <label for="product-size-photo" class="form-label mt-4">Size guide image <span class="biz-muted">(recommended)</span></label>
+            <div class="biz-photo-box"><img v-if="sizePhotoPreview" :src="sizePhotoPreview" alt="Size guide preview" /><span v-else>Add a simple measurement chart so customers can choose confidently.</span></div>
+            <input id="product-size-photo" type="file" accept="image/jpeg,image/png,image/webp" class="form-control mt-2" @change="chooseSizePhoto" />
+            <p class="biz-muted small mt-1">Shown as the second image on the customer product page. Leave empty when editing to keep the current guide.</p>
           </div>
           <div class="col-lg-8">
             <div class="biz-field"><label for="product-name" class="form-label">Product name <span aria-hidden="true">*</span></label><input id="product-name" v-model.trim="form.name" class="form-control" required maxlength="80" /></div>
             <div class="row g-3">
               <div class="col-sm-6 biz-field"><label for="product-price" class="form-label">Price (S$) <span aria-hidden="true">*</span></label><input id="product-price" v-model="form.price" type="number" class="form-control" min="0" max="100000" step="0.01" required /></div>
-              <div class="col-sm-6 biz-field"><label for="product-stock" class="form-label">Stock <span aria-hidden="true">*</span></label><input id="product-stock" v-model="form.stock" type="number" class="form-control" min="0" max="100000" step="1" required /></div>
               <div class="col-sm-6 biz-field"><label for="product-style" class="form-label">Style <span aria-hidden="true">*</span></label><select id="product-style" v-model="form.style" class="form-select" required><option disabled value="">Select a style</option><option v-for="style in styles" :key="style">{{ style }}</option></select></div>
               <div class="col-sm-6 biz-field"><label for="product-category" class="form-label">Category <span aria-hidden="true">*</span></label><select id="product-category" v-model="form.category" class="form-select" required><option disabled value="">Select a category</option><option v-for="category in categories" :key="category">{{ category }}</option></select></div>
               <fieldset class="col-12 biz-field">
                 <legend class="form-label">Available colours <span aria-hidden="true">*</span></legend>
-                <p class="biz-muted small">Choose at least one. Customers choose one of these colours at checkout.</p>
+                <p class="biz-muted small">Only tick colours you sell, up to 6. One colour needs one photo. If you tick more, add a photo for each.</p>
                 <div class="biz-chip-group">
                   <label v-for="(colour, index) in colours" :key="colour" class="biz-chip">
                     <input v-model="form.colours" type="checkbox" :value="colour" :required="index === 0 && !form.colours.length" />
@@ -88,7 +160,25 @@ export default {
             </div>
             <fieldset class="biz-field"><legend class="form-label">Occasions <span aria-hidden="true">*</span></legend>
               <div class="biz-chip-group"><label v-for="occasion in occasions" :key="occasion" class="biz-chip"><input v-model="form.occasions" type="checkbox" :value="occasion" /> <span>{{ occasion }}</span></label></div></fieldset>
-            <div class="biz-field"><label for="product-sizes" class="form-label">Sizes, separated by commas <span aria-hidden="true">*</span></label><input id="product-sizes" v-model="form.sizes" class="form-control" required maxlength="200" placeholder="e.g. S, M, L" /></div>
+            <fieldset class="biz-field">
+              <legend class="form-label">Sizes and stock <span aria-hidden="true">*</span></legend>
+              <p class="biz-muted small">Enter how many you have of each size. When a customer buys a size, only that size's stock goes down.</p>
+              <p v-if="isShoes" class="biz-muted small">Shoes use US number sizes only, like 9 or 9.5.</p>
+              <p v-if="legacyStock !== null" class="biz-error small" role="status">This listing was made before stock per size. It had {{ legacyStock }} in stock shared across all sizes. Enter the stock for each size, then save.</p>
+              <div class="size-quick" aria-label="Quick add a size">
+                <button v-for="size in quickSizes" :key="size" type="button" class="biz-btn biz-btn-outline biz-btn-small" :disabled="hasSize(size) || form.sizeRows.length >= 12 && !form.sizeRows.some(r => !r.size.trim())" @click="addSize(size)">+ {{ size }}</button>
+              </div>
+              <div class="size-stock-head" aria-hidden="true"><span>Size</span><span>Stock</span><span></span></div>
+              <div v-for="(row, index) in form.sizeRows" :key="index" class="size-stock-row">
+                <input v-model="row.size" class="form-control" required maxlength="20" :placeholder="isShoes ? 'e.g. 9' : 'e.g. M'" :aria-label="`Size ${index + 1} name`" />
+                <input v-model="row.stock" type="number" class="form-control" min="0" max="100000" step="1" required placeholder="0" :aria-label="`Stock for size ${row.size || index + 1}`" />
+                <button type="button" class="biz-btn biz-btn-outline biz-btn-small" :aria-label="`Remove size ${row.size || index + 1}`" @click="removeSize(index)">Remove</button>
+              </div>
+              <div class="size-stock-foot">
+                <button type="button" class="biz-btn biz-btn-outline biz-btn-small" :disabled="form.sizeRows.length >= 12" @click="addSize()">+ Add another size</button>
+                <span>Total stock: <strong>{{ totalStock }}</strong></span>
+              </div>
+            </fieldset>
             <div class="biz-field"><label for="product-description" class="form-label">Description <span aria-hidden="true">*</span></label><textarea id="product-description" v-model.trim="form.description" class="form-control" rows="3" required maxlength="1000"></textarea></div>
             <div v-if="editing" class="biz-field"><label for="product-status" class="form-label">Visibility</label><select id="product-status" v-model="form.status" class="form-select"><option value="active">Showing in store</option><option value="hidden">Hidden from store</option></select></div>
             <div v-if="error" class="biz-error" role="alert">{{ error }}</div>
@@ -102,3 +192,11 @@ export default {
     </form>
   </section>
 </template>
+
+<style scoped>
+.size-quick { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.size-stock-head, .size-stock-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 10px; align-items: center; }
+.size-stock-head { font-size: 13px; font-weight: 600; color: #6f6372; margin-bottom: 6px; }
+.size-stock-row { margin-bottom: 10px; }
+.size-stock-foot { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; margin-top: 4px; font-size: 15px; }
+</style>

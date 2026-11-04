@@ -106,7 +106,7 @@ test("Private wardrobe HTTP workflows", async (t) => {
   app.use(
     "/api/wardrobe",
     requireAuth,
-    createWardrobeRouter(models, async () => weather),
+    createWardrobeRouter(models, async () => weather, async () => ({})),
   );
   app.use((error, req, res, next) =>
     res.status(error.status || 500).json({ message: error.message }),
@@ -183,6 +183,27 @@ test("Private wardrobe HTTP workflows", async (t) => {
       ).body.item;
     },
   );
+  await t.test("current wardrobe styles and all seven dressing types work through the API", async () => {
+    const { STYLES, OCCASIONS } = require("../services/wardrobeValidation");
+    for (const style of STYLES) {
+      const edited = await api("/items/" + top.itemId, "PUT", input({ style: [style] }));
+      assert.equal(edited.status, 200);
+      assert.deepEqual(edited.body.item.style, [style]);
+    }
+    for (const retired of ["Casual", "Formal", "Smart casual", "Cosplay"])
+      assert.equal((await api("/items", "POST", input({ style: [retired] }))).status, 400);
+    for (const occasion of OCCASIONS) {
+      const result = await api("/recommendations", "POST", { occasion, style: "Romantic" });
+      assert.equal(result.status, 200);
+      assert.ok(result.body.plans.length);
+      const selection = await api("/selection", "POST", { occasion, style: "Romantic", itemIds: [top.itemId] });
+      assert.equal(selection.status, 200);
+      assert.ok(Number.isFinite(selection.body.selection.matchScore));
+    }
+    assert.equal((await api("/recommendations", "POST", { occasion: "Work", style: "Classic" })).status, 200);
+    assert.equal((await api("/recommendations", "POST", { occasion: "Formal events", style: "Cosplay" })).status, 400);
+    await api("/items/" + top.itemId, "PUT", input());
+  });
   await t.test(
     "existing wardrobe records ignore legacy manual suitability labels",
     async () => {
@@ -305,7 +326,7 @@ test("Private wardrobe HTTP workflows", async (t) => {
       assert.ok(otherOccasion.body.items.every(item => item.recommendation.kind === "style" && item.recommendation.label === "Matches your style"));
       const otherStyle = await api("/recommendations", "POST", {
         occasion: "Presentation",
-        style: "Formal",
+        style: "Classic",
       });
       assert.deepEqual(
         [...otherStyle.body.recommendedIds].sort(),
@@ -313,7 +334,7 @@ test("Private wardrobe HTTP workflows", async (t) => {
       );
       const neither = await api("/recommendations", "POST", {
         occasion: "Interview",
-        style: "Formal",
+        style: "Classic",
       });
       assert.deepEqual(neither.body.recommendedIds, []);
     },
@@ -444,6 +465,77 @@ test("Private wardrobe HTTP workflows", async (t) => {
       );
     },
   );
+  await t.test("saved outfit editing keeps its ID, checks ownership and validates every replacement", async () => {
+    const create = await api("/outfits", "POST", {
+      name: "Original look", occasion: "Presentation", date: singaporeToday(),
+      itemIds: [top.itemId, bottom.itemId, shoes.itemId],
+    });
+    assert.equal(create.status, 201);
+    const outfitId = create.body.outfitId, url = "/outfits/" + outfitId;
+    const original = (await api(url)).body.outfit;
+    assert.equal(original.name, "Original look");
+    assert.equal(original.pieces.length, 3);
+    assert.equal((await api(url, "GET", null, "bob")).status, 404);
+    assert.equal((await api(url, "PUT", { name: "Forged" }, "bob")).status, 404);
+    assert.equal((await api(url, "GET", null, null)).status, 401);
+    assert.equal((await api(url, "PUT", {}, null)).status, 401);
+    assert.equal((await api("/outfits/not-an-id")).status, 404);
+    const dress = (await api("/items", "POST", input({ name: "Edit dress", category: "Dresses", style: ["Classic"] }))).body.item;
+    const replacement = { name: "Updated look", occasion: "Casual outing", date: singaporeToday(), itemIds: [dress.itemId, shoes.itemId], userId: "bob" };
+    const count = models.Outfit.rows.length;
+    const update = await api(url, "PUT", replacement);
+    assert.equal(update.status, 200);
+    assert.equal(update.body.outfitId, outfitId);
+    assert.equal(models.Outfit.rows.length, count, "editing must not create another saved outfit");
+    const result = (await api(url)).body.outfit;
+    assert.equal(result.outfitId, outfitId);
+    assert.equal(result.createdAt, original.createdAt);
+    assert.equal(result.name, "Updated look");
+    assert.equal(result.occasion, "Casual outings");
+    assert.deepEqual(result.pieces.map(piece => piece.itemId).sort(), [dress.itemId, shoes.itemId].sort());
+    const foreign = (await api("/items", "POST", input(), "bob")).body.item;
+    for (const changes of [
+      { name: "" }, { itemIds: [] }, { itemIds: [dress.itemId] }, { itemIds: [dress.itemId, dress.itemId, shoes.itemId] },
+      { itemIds: [foreign.itemId, bottom.itemId, shoes.itemId] }, { itemIds: [dress.itemId, top.itemId, shoes.itemId] },
+      { date: "2026-02-30" }, { date: "2000-01-01" },
+    ]) {
+      const invalid = await api(url, "PUT", { ...replacement, ...changes });
+      assert.equal(invalid.status, 400, JSON.stringify(changes));
+      assert.deepEqual((await api(url)).body.outfit, result, "a failed update must preserve the saved outfit");
+    }
+    await api("/items/" + dress.itemId, "DELETE");
+    assert.equal((await api(url)).body.outfit.pieces.find(piece => piece.itemId === dress.itemId).missing, true);
+    await api(url, "DELETE");
+    assert.equal((await api(url)).status, 404);
+    assert.equal((await api(url, "PUT", replacement)).status, 404);
+  });
+  await t.test("edit details preserve the selected store colour and mark unavailable store pieces without losing the outfit", async () => {
+    const product = await models.Product.create({
+      businessId: "edit-shop", businessName: "Edit shop", name: "Edit blazer", category: "Jackets", style: "Classic",
+      colours: ["Black", "White"], material: "Linen", sizes: ["M"], price: 39, stock: 2, description: "Edit test",
+      photo: { data: Buffer.from(png.split(",")[1], "base64"), contentType: "image/png" },
+    });
+    const body = { name: "With store pick", occasion: "Presentation", date: singaporeToday(), itemIds: [top.itemId, bottom.itemId, shoes.itemId], productId: String(product._id), productColour: "Black" };
+    const saved = await api("/outfits", "POST", body), url = "/outfits/" + saved.body.outfitId;
+    assert.equal(saved.status, 201);
+    const before = (await api(url)).body.outfit;
+    assert.equal(before.pieces.find(piece => piece.source === "store").colour, "Black");
+    assert.equal(before.pieces.find(piece => piece.source === "store").missing, false);
+    assert.equal((await api(url, "PUT", { ...body, name: "New store look", product: { name: "Forged", price: 0 } })).status, 200);
+    assert.equal((await api(url)).body.outfit.pieces.find(piece => piece.source === "store").price, 39);
+    product.colours = ["White"];
+    const unavailableVariant = (await api(url)).body.outfit;
+    assert.equal(unavailableVariant.pieces.find(piece => piece.source === "store").missing, true);
+    assert.equal((await api(url, "PUT", body)).status, 400);
+    product.colours = ["Black", "White"]; product.stock = 0;
+    assert.equal((await api(url)).body.outfit.pieces.find(piece => piece.source === "store").missing, true);
+    assert.equal((await api(url, "PUT", body)).status, 404);
+    assert.equal((await api(url)).body.outfit.pieces.length, 4);
+    const withoutStore = { ...body, productId: undefined, productColour: undefined, name: "Wardrobe only" };
+    assert.equal((await api(url, "PUT", withoutStore)).status, 200);
+    assert.equal((await api(url)).body.outfit.pieces.length, 3);
+    await api(url, "DELETE");
+  });
   await t.test(
     "save checks ownership, lists privately and marks deleted pieces",
     async () => {
@@ -569,6 +661,18 @@ test("weather handles Singapore dates, API failure and out-of-range forecasts ho
   assert.deepEqual(forecast.tags, ["Warm", "Rainy"]);
   assert.equal(requested.searchParams.get("timezone"), "Asia/Singapore");
   assert.equal(forecast.condition, "Thunderstorms");
+  assert.equal(forecast.weatherCode, 95);
+  // Preserve the API code so the planner can distinguish sunny, partly cloudy and overcast.
+  for (const [code, condition] of [[0, "Clear skies"], [2, "Partly cloudy"], [3, "Overcast"], [45, "Foggy"], [61, "Rain / showers"], [71, "Snow"]]) {
+    const result = await getWeather(today, async () => ({
+      ok: true,
+      json: async () => ({ daily: { time: [today], temperature_2m_max: [29], weather_code: [code], precipitation_probability_max: [null] } }),
+    }));
+    assert.equal(result.available, true);
+    assert.equal(result.weatherCode, code);
+    assert.equal(result.condition, condition);
+    assert.equal(result.rainChance, null);
+  }
   assert.equal(
     (
       await getWeather(today, async () => {
@@ -787,4 +891,69 @@ test("basic-piece completion is independent of match quality and accessories are
   );
   assert.deepEqual(dress.basics, { selected: 2, total: 2, percent: 100 });
   assert.equal(dress.complete, true);
+});
+
+test("wardrobe taxonomy, Romantic scoring and legacy compatibility use current dressing labels", () => {
+  const { STYLES, OCCASIONS, itemInput, occasionInput } = require("../services/wardrobeValidation");
+  const { inferSuitability } = require("../services/clothingSuitability");
+  const { occasionRating, assessSelection, recommendationFor } = require("../services/outfitMatching");
+  assert.deepEqual(STYLES, ["Minimalist", "Streetwear", "Vintage", "Y2K", "Preppy", "Classic", "Romantic"]);
+  assert.deepEqual(OCCASIONS, ["University", "Presentation", "Interview", "Date", "Internship / work", "Casual outings", "Formal events"]);
+  const romantic = { name: "Silk dress", category: "Dresses", colour: "Pink", material: "Silk", style: ["Romantic"] };
+  assert.equal(occasionRating(romantic, "Date").components[0].earned, 30);
+  assert.equal(occasionRating(romantic, "Interview").components[0].earned, 6);
+  assert.equal(occasionRating(romantic, "Formal events").components[0].earned, 27);
+  assert.equal(recommendationFor(romantic, { occasion: "Date" }).kind, "occasion");
+  assert.equal(recommendationFor(romantic, { occasion: "Interview", styles: ["Romantic"] }).kind, "style");
+  for (const occasion of OCCASIONS) for (const style of STYLES) {
+    const selected = assessSelection([{ ...romantic, style: [style] }], occasion, [], weather);
+    assert.ok(selected.matchScore >= 5 && selected.matchScore <= 100);
+    assert.deepEqual(selected.scoreDetails.components.map(c => c.weight), [60, 25, 15]);
+    for (const comment of selected.comments)
+      assert.doesNotMatch(comment.text, /smart.casual|cosplay|formal pieces|casual pieces/i);
+  }
+  const inferred = inferSuitability(romantic);
+  assert.ok(inferred.occasions.includes("Date") && inferred.occasions.includes("Formal events"));
+  assert.ok(inferred.occasions.every(value => OCCASIONS.includes(value)));
+  for (const [old, current] of [["Work", "Internship / work"], ["Casual outing", "Casual outings"], ["Formal dinner", "Formal events"]]) {
+    assert.equal(occasionInput(old), current);
+    assert.deepEqual(occasionRating(romantic, old), occasionRating(romantic, current));
+    assert.ok(assessSelection([romantic], old, [], weather));
+  }
+  const legacy = { ...romantic, style: ["Formal"] };
+  assert.equal(occasionRating(legacy, "Interview").components[0].earned, 30);
+  assert.throws(() => itemInput(legacy, false));
+  assert.doesNotThrow(() => itemInput(legacy, false, { allowLegacyStyles: true }));
+});
+
+test("entered plastic and unfamiliar materials are not reported as missing", () => {
+  const { assessSelection, occasionRating, weatherRating } = require("../services/outfitMatching");
+  const shoe = { name: "ASICS shoe", category: "Shoes", colour: "Black", style: ["Minimalist"], material: "plastic" };
+  for (const material of ["plastic", " Plastic ", "PLASTIC"]) {
+    const piece = { ...shoe, material };
+    for (const [occasion, points] of [["Presentation", 2], ["Casual outings", 4]]) {
+      const selection = assessSelection([piece], occasion, [], weather);
+      const component = selection.scoreDetails.itemDetails[0].components.find(c => c.label === "Material");
+      assert.equal(component.provided, true);
+      assert.equal(component.available, true);
+      assert.equal(component.earned, points);
+      assert.equal(selection.comments.some(c => /adding.*material/i.test(c.text)), false);
+      assert.ok(selection.matchScore > 0);
+    }
+    assert.equal(weatherRating(piece, weather), null); // Generic plastic does not prove weather protection.
+  }
+  const unfamiliar = { ...shoe, material: "Carbon-fibre composite" };
+  const selection = assessSelection([unfamiliar], "Presentation", [], weather);
+  const component = selection.scoreDetails.itemDetails[0].components.find(c => c.label === "Material");
+  assert.equal(component.provided, true);
+  assert.equal(component.available, false);
+  assert.equal(component.earned, 0); // Do not invent suitability points for unfamiliar materials.
+  assert.equal(selection.comments.some(c => /adding.*material/i.test(c.text)), false);
+  assert.ok(selection.comments.some(c => c.text === "The material for ASICS shoe is saved, but its suitability is not assessed yet."));
+  for (const material of [undefined, null, "", "  ", "Unknown", "Not specified"]) {
+    const missing = assessSelection([{ ...shoe, material }], "Presentation", [], weather);
+    assert.ok(missing.comments.some(c => c.text === "Try adding material details for ASICS shoe."));
+  }
+  assert.equal(occasionRating({ ...shoe, material: "Rubber" }, "Presentation").components.find(c => c.label === "Material").earned, 2);
+  assert.equal(weatherRating({ ...shoe, material: "Waterproof plastic" }, weather).ratio, 1);
 });

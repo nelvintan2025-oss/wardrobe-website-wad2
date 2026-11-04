@@ -55,6 +55,17 @@ test('video upload rejects invalid video MIME/data safely', async () => {
   assert.match((await res.json()).message, /MP4 or WebM/);
 });
 
+test('MP4-labeled non-video bytes are rejected instead of storing unplayable content', async () => {
+  Business.findOne = async () => ({ _id: businessId });
+  Product.findOne = async () => ({ _id: productId, name: 'T-shirt', status: 'active', stock: 1 });
+  let created = false;
+  StyleVideo.create = async () => { created = true };
+  const fakeMp4 = 'data:video/mp4;base64,' + Buffer.from('these are not real video bytes').toString('base64');
+  const response = await call('', 'POST', { productId, caption: 'Fake clip', video: fakeMp4 });
+  assert.equal(response.status, 400);
+  assert.equal(created, false);
+});
+
 test('boost refuses unavailable products without spending a coin', async () => {
   Business.findOne = async () => ({ _id: businessId });
   StyleVideo.findOne = async () => ({ _id: videoId, businessId, productId });
@@ -65,6 +76,44 @@ test('boost refuses unavailable products without spending a coin', async () => {
   assert.equal(res.status, 409);
   assert.match((await res.json()).message, /in-stock/);
   assert.equal(debited, false);
+});
+
+test('a business may delete ordinary, active-boosted, or paused-boosted videos', async () => {
+  Business.findOne = async () => ({ _id: businessId });
+  for (const state of ['ordinary', 'active', 'paused']) {
+    let deletes = 0;
+    StyleVideo.findOne = async () => ({
+      _id: videoId, businessId, productId,
+      boostedUntil: state === 'ordinary' ? null : new Date(Date.now() + 86400000),
+      boostPausedAt: state === 'paused' ? new Date() : null,
+      deleteOne: async () => { deletes++ },
+    });
+    const response = await call(`/${videoId}`, 'DELETE');
+    assert.equal(response.status, 200, `delete ${state} video`);
+    assert.equal((await response.json()).message, 'Video deleted.');
+    assert.equal(deletes, 1, `delete exactly one ${state} video`);
+  }
+});
+
+test("a business cannot delete another business\'s video", async () => {
+  Business.findOne = async () => ({ _id: businessId });
+  let deletes = 0;
+  StyleVideo.findOne = async query => {
+    assert.equal(query.businessId, businessId, 'ownership is checked in the database query');
+    return null;
+  };
+  const response = await call(`/${videoId}`, 'DELETE');
+  assert.equal(response.status, 404);
+  assert.equal(deletes, 0);
+});
+
+test('Style Feed Studio allows deleting active boosts and warns about forfeiting remaining promotion', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const source = fs.readFileSync(path.resolve(__dirname, '../../src/view/business/StyleVideos.vue'), 'utf8');
+  assert.doesNotMatch(source, /:disabled="busy !== '' \|\| post\.boostRemainingMs > 0"/);
+  assert.match(source, /post\.boostRemainingMs > 0[\s\S]*?window\.confirm\(message\)/);
+  assert.match(source, /remaining promotion time and coins spent will not be refunded/i);
 });
 
 test('video endpoint supports range seeking and invalid-range responses', async () => {
@@ -94,6 +143,23 @@ test('like endpoint toggles between liked and unliked counts', async () => {
   assert.deepEqual(await second.json(), { liked: false, likes: 0 });
 });
 
+
+test('prepaid boosted videos are still eligible after 120 newer videos arrive', async () => {
+  const organic = Array.from({ length: 120 }, (_, i) => ({ _id: `organic-${i}`, productId, businessId, caption: 'Clip', likes: 0, likesBy: [] }));
+  const oldBoosted = { _id: videoId, productId, businessId, caption: 'Paid clip', likes: 0, likesBy: [],
+    boostedUntil: new Date(Date.now() + 86400000), boostPausedAt: null };
+  StyleVideo.find = query => {
+    const collection = query?.boostedUntil ? [oldBoosted] : organic;
+    return { sort() { return this }, limit() { return this }, select: async () => collection };
+  };
+  Product.find = async () => [{ _id: productId, status: 'active', stock: 3, name: 'Shirt', price: 20 }];
+  Business.find = async () => [{ _id: businessId, businessName: 'Shop A' }];
+  const response = await call('');
+  assert.equal(response.status, 200);
+  const feed = (await response.json()).videos;
+  assert.ok(feed.some(post => post.videoId === videoId && post.boosted), 'paid clip must not be excluded by 120 newest upload cap');
+  assert.equal(feed.filter(post => post.videoId === videoId).length, 1);
+});
 
 test('feed GET respects sponsored slots and avoids previous first post after refresh', async () => {
   const videos = Array.from({ length: 8 }, (_, i) => {

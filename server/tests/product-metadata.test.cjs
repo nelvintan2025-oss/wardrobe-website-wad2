@@ -10,7 +10,7 @@ const { productInput } = require('../businessValidation');
 const { listedColours } = require('../services/listedColours');
 const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
 const details = { name: 'Everyday shirt', price: 38, category: 'Tops', style: 'Minimalist', colours: ['White', 'Black'], material: '  Linen  ',
-  stock: 3, occasions: ['Presentation'], sizes: ['M'], description: 'Pair with blue jeans.', photo: png };
+  stock: 3, occasions: ['Presentation'], sizes: ['M'], description: 'Pair with blue jeans.', photo: png, colourPhotos: { Black: png } };
 
 test('product metadata is required and validated with the wardrobe colour palette and material limit', async () => {
   assert.equal(productInput(details, { photoRequired: true }).material, 'Linen');
@@ -39,7 +39,7 @@ test('business product create/edit persists metadata, keeps photos and passes tr
   app.use('/api', requireAuth);
   app.use('/api/business', createBusinessRouter(models));
   app.use('/api/catalog', createCatalogRouter(models));
-  app.use('/api/wardrobe', createWardrobeRouter(models, async () => ({ available: true, tags: ['Warm'], temperature: 31 })));
+  app.use('/api/wardrobe', createWardrobeRouter(models, async () => ({ available: true, tags: ['Warm'], temperature: 31 }), async () => ({})));
   const server = await new Promise(resolve => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
   t.after(() => new Promise(resolve => server.close(resolve)));
   const base = `http://127.0.0.1:${server.address().port}/api`;
@@ -59,7 +59,7 @@ test('business product create/edit persists metadata, keeps photos and passes tr
   assert.equal(created.body.product.material, 'Linen');
   assert.deepEqual(created.body.product.availableColours, ['White', 'Black']);
   assert.equal((await models.Product.findById(id)).material, 'Linen');
-  const edit = { ...details, colours: ['Black', 'Navy'], material: 'Cotton' }; delete edit.photo;
+  const edit = { ...details, colours: ['Black', 'Navy'], material: 'Cotton', colourPhotos: { Navy: png } }; delete edit.photo;
   assert.equal((await api(`/business/products/${id}`, 'PUT', edit, 'other')).status, 404);
   const edited = await api(`/business/products/${id}`, 'PUT', edit);
   assert.equal(edited.status, 200);
@@ -83,6 +83,23 @@ test('business product create/edit persists metadata, keeps photos and passes tr
   assert.equal(variant.body.selection.scoreDetails.itemDetails[0].earned, 42);
   for (const productColour of ['Red', ['Black', 'Navy']])
     assert.equal((await api('/wardrobe/selection', 'POST', { occasion: 'Presentation', itemIds: [], productId: id, productColour }, 'customer')).status, 400);
+  // A business shoe and a private wardrobe shoe use their saved plastic material.
+  const plasticProduct = await api('/business/products', 'POST', { ...details, name: 'ASICS shoe', category: 'Shoes', colours: ['Black'], material: 'plastic', sizes: ['9'] });
+  assert.equal(plasticProduct.status, 201);
+  const storeSelection = await api('/wardrobe/selection', 'POST', { occasion: 'Presentation', itemIds: [], productId: plasticProduct.body.product.productId, productColour: 'Black' }, 'customer');
+  assert.equal(storeSelection.status, 200);
+  const wardrobeShoe = await api('/wardrobe/items', 'POST', { name: 'ASICS shoe', category: 'Shoes', colour: 'Black', material: 'plastic', style: ['Minimalist'], photo: png }, 'customer');
+  assert.equal(wardrobeShoe.status, 201);
+  const ownedSelection = await api('/wardrobe/selection', 'POST', { occasion: 'Presentation', itemIds: [wardrobeShoe.body.item.itemId] }, 'customer');
+  assert.equal(ownedSelection.status, 200);
+  for (const result of [storeSelection, ownedSelection]) {
+    assert.equal(result.body.selection.pieces[0].material, 'plastic');
+    const material = result.body.selection.scoreDetails.itemDetails[0].components.find(c => c.label === 'Material');
+    assert.equal(material.available, true);
+    assert.equal(material.provided, true);
+    assert.equal(material.earned, 2);
+    assert.equal(result.body.selection.comments.some(c => /adding.*material/i.test(c.text)), false);
+  }
   const legacy = await models.Product.create({ ...productInput(details, { photoRequired: true }), businessId: String(models.Business.rows[0]._id), businessName: 'shop' });
   legacy.colours = undefined; legacy.colour = 'White'; legacy.material = undefined; await legacy.save();
   const old = await api(`/catalog/products/${legacy._id}`, 'GET', null, 'customer');
