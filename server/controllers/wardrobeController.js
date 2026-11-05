@@ -1,4 +1,4 @@
-const { inferSuitability } = require("../services/clothingSuitability");
+const { inferSuitability, itemColours } = require("../services/clothingSuitability");
 const mongoose = require("mongoose");
 const UserModel = require("../models/User");
 const { stockForSize } = require("../services/sizeStock");
@@ -24,6 +24,7 @@ function itemJson(doc) {
     name: doc.name,
     category: doc.category,
     colour: doc.colour,
+    colours: itemColours(doc),
     style: doc.style,
     material: doc.material,
     ...inferSuitability(doc),
@@ -51,10 +52,12 @@ function createWardrobeController(
     return {
       productId: String(doc._id), name: doc.name, category: doc.category,
       businessId: String(doc.businessId), businessName: doc.businessName, description: doc.description || '',
-      style: [doc.style], material: doc.material || '', colour, size,
+      style: [doc.style], material: doc.material || '', colour, colours: itemColours({ colour }), size,
       availableColours: listedColours(doc), price: doc.price, source: 'store',
       ...inferSuitability({ category: doc.category, colour, material: doc.material, style: [doc.style] }),
-      imageURL: `/api/catalog/products/${doc._id}/image`,
+      imageURL: doc.colourPhotos?.some(row => row.colour === colour)
+        ? `/api/catalog/products/${doc._id}/colour-image/${encodeURIComponent(colour)}`
+        : `/api/catalog/products/${doc._id}/image`,
     };
   }
   async function storeProduct(productId, selectedColour, selectedSize, requireVariant = false) {
@@ -123,11 +126,33 @@ function createWardrobeController(
     const entry = { productId: piece.productId, colour: piece.colour, size: piece.size };
     const user = await User.findOne(filter).select('+plannerProducts');
     if (!user) return res.status(404).json({ message: 'Account not found.' });
+    const requireNew = req.body.requireNewProduct === true;
+    if (requireNew && (user.plannerProducts || []).some(piece => String(piece.productId) === entry.productId))
+      throw Object.assign(new Error('This product is already in your planner. Refresh its details and update the existing item.'), { status: 409 });
     if ((user.plannerProducts || []).some(piece => productKey(piece) === productKey(entry))) return res.json(await plannerJson(user));
-    const updated = await User.findOneAndUpdate({ ...filter, 'plannerProducts.29': { $exists: false } },
+    const updated = await User.findOneAndUpdate({ ...filter, 'plannerProducts.29': { $exists: false }, ...(requireNew ? { plannerProducts: user.plannerProducts } : {}) },
       { $addToSet: { plannerProducts: entry } }, { new: true, runValidators: true, projection: { plannerProducts: 1 } });
+    if (!updated && requireNew) throw Object.assign(new Error('Your planner changed in another tab or is full. Refresh before adding this product.'), { status: 409 });
     if (!updated) throw v.badRequest('Your planner can hold up to 30 store products. Remove one before adding another.');
     res.json(await plannerJson(updated));
+  }
+  async function updatePlannerProduct(req, res) {
+    const filter = plannerOwner(req), ref = productRefs({ products: [req.body] })[0];
+    const user = await User.findOne(filter).select('+plannerProducts');
+    if (!user) return res.status(404).json({ message: 'Account not found.' });
+    const previous = (user.plannerProducts || []).map(piece => ({ productId: piece.productId, colour: piece.colour || '', size: piece.size || '' }));
+    const source = previous.find(piece => productKey(piece) === req.params.key);
+    if (!source) throw Object.assign(new Error('This planner item changed or was removed. Reopen it from your planner.'), { status: 409 });
+    if (String(source.productId) !== ref.productId) throw v.badRequest('Update the same product already in your planner.');
+    const piece = await storeProduct(ref.productId, ref.colour, ref.size, true);
+    const entry = { productId: source.productId, colour: piece.colour, size: piece.size };
+    // Replace the original variant; collapse a matching destination rather than duplicating it.
+    const entries = previous.filter(item => productKey(item) !== productKey(source) && productKey(item) !== productKey(entry));
+    entries.splice(Math.min(previous.indexOf(source), entries.length), 0, entry);
+    const updated = await User.findOneAndUpdate({ ...filter, plannerProducts: user.plannerProducts },
+      { $set: { plannerProducts: entries } }, { new: true, runValidators: true, projection: { plannerProducts: 1 } });
+    if (!updated) throw Object.assign(new Error('Your planner changed in another tab. Refresh and try again.'), { status: 409 });
+    res.json({ ...await plannerJson(updated), key: productKey(entry) });
   }
   async function removePlannerProduct(req, res) {
     const filter = plannerOwner(req), user = await User.findOne(filter).select('+plannerProducts');
@@ -274,7 +299,7 @@ function createWardrobeController(
     const pieces = [...docs.map(itemJson), ...store.products];
     if (pieces.length > 6) throw v.badRequest("Choose up to six outfit pieces.");
     let colourMatches = {};
-    try { colourMatches = await colourProvider(pieces.map(piece => piece.colour)); }
+    try { colourMatches = await colourProvider(pieces.flatMap(itemColours)); }
     catch { /* Palette lookup must never prevent selecting or saving an outfit. */ }
     res.json({
       selection: assessSelection(
@@ -322,7 +347,7 @@ function createWardrobeController(
       pieces: outfit.pieces.map(piece => ({
         itemId: piece.itemId, productId: piece.productId, name: piece.name,
         size: piece.size, businessId: piece.businessId, businessName: piece.businessName,
-        category: piece.category, colour: piece.colour, style: piece.style,
+        category: piece.category, colour: piece.colour, colours: itemColours(piece), style: piece.style,
         occasions: piece.occasions, source: piece.source, price: piece.price,
         missing: piece.source === "wardrobe" && !available.has(piece.itemId),
         imageURL: piece.source === "wardrobe"
@@ -377,7 +402,7 @@ function createWardrobeController(
     res.json({ message: "Outfit removed." });
   }
   return {
-    plannerProducts, addPlannerProduct, removePlannerProduct,
+    plannerProducts, addPlannerProduct, updatePlannerProduct, removePlannerProduct,
     list,
     get,
     create,

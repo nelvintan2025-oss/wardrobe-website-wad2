@@ -107,10 +107,17 @@ async function persistCart(lines, ctx) {
   if (!Array.isArray(result.cart)) throw new Error('The server returned unexpected cart data. Please refresh your cart.')
   shopState.cart = result.cart
 }
-export function addToCart(product, { size = '', colour = '', quantity = 1 } = {}) {
+export function addToCart(product, { size = '', colour = '', quantity = 1, requireNewProduct = false } = {}) {
   return mutate(async ctx => {
     if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10 || !product.stock) throw new Error('Choose an available quantity between 1 and 10.')
     const line = { productId: String(product.productId), size, colour, quantity }
+    if (requireNewProduct) {
+      if (shopState.cart.some(item => item.productId === line.productId)) throw new Error('This product is already in your cart. Use Update cart item.');
+      const result = await request('/cart', { method: 'PUT', body: JSON.stringify({ cart: [line], newProductId: line.productId }) }, ctx);
+      if (!Array.isArray(result.cart)) throw new Error('Unexpected cart response. Please refresh your cart.');
+      shopState.cart = result.cart;
+      return result.cart.find(item => item.key === lineKey(line));
+    }
     const lines = shopState.cart.map(item => ({ ...item })), existing = lines.find(item => item.key === lineKey(line))
     // Person 4: the limit is the stock of the chosen size (older listings share one stock).
     const max = Number((product.sizeStock && size ? product.sizeStock[size] : product.stock) || 0)
@@ -120,6 +127,19 @@ export function addToCart(product, { size = '', colour = '', quantity = 1 } = {}
     else lines.push({ ...line, quantity: amount })
     await persistCart(lines, ctx)
   })
+}
+// Editing a cart link replaces its original line; it does not add another purchase.
+export function updateCartItem(key, product, { size = '', colour = '', quantity = 1 } = {}) {
+  return mutate(async ctx => {
+    if (!key || !Number.isInteger(quantity) || quantity < 1 || quantity > 10)
+      throw new Error('Choose an available quantity between 1 and 10.');
+    const result = await request('/cart/' + encodeURIComponent(key), {
+      method: 'PUT', body: JSON.stringify({ productId: String(product.productId), size, colour, quantity }),
+    }, ctx);
+    if (!Array.isArray(result.cart) || typeof result.key !== 'string') throw new Error('Unexpected cart response. Please refresh your cart.');
+    shopState.cart = result.cart;
+    return result.cart.find(item => item.key === result.key);
+  });
 }
 export function updateCartQuantity(key, quantity) {
   return mutate(async ctx => {

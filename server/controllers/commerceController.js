@@ -87,14 +87,24 @@ function createShoppingController(models = { User, Product }) {
   }
   async function setCart(req, res) {
     if (!Array.isArray(req.body?.cart) || req.body.cart.length > 30) fail(400, 'Choose up to 30 cart items.');
-    const lines = req.body.cart.map(line => {
+    let lines = req.body.cart.map(line => {
       if (!line || !mongoose.isObjectIdOrHexString(line.productId) || !Number.isInteger(line.quantity) || line.quantity < 1 || line.quantity > 10 ||
           typeof line.size !== 'string' || line.size.length > 20 || typeof line.colour !== 'string' || line.colour.length > 20)
         fail(400, 'Choose valid products, quantities, sizes and colours.');
       return { productId: String(line.productId), size: line.size, colour: line.colour, quantity: line.quantity };
     });
     if (new Set(lines.map(lineKey)).size !== lines.length) fail(400, 'Combine duplicate cart items first.');
-    const user = await account(req), products = await productsFor(lines.map(line => line.productId));
+    const user = await account(req), newProductId = req.body.newProductId;
+    if (newProductId !== undefined) {
+      if (!mongoose.isObjectIdOrHexString(newProductId) || lines.length !== 1 || lines[0].productId !== String(newProductId))
+        fail(400, 'Choose one new product to add.');
+      if ((user.cartItems || []).some(line => String(line.productId) === String(newProductId)))
+        fail(409, 'This product is already in your cart. Refresh its details and update the existing item.');
+      // Merge into the server's current cart, so a stale tab cannot drop other items.
+      lines = [...(user.cartItems || []).map(line => ({ productId: String(line.productId), size: line.size || '', colour: line.colour || '', quantity: line.quantity })), ...lines];
+      if (lines.length > 30) fail(400, 'Choose up to 30 cart items.');
+    }
+    const products = await productsFor(lines.map(line => line.productId));
     const previous = new Map((user.cartItems || []).map(line => [lineKey(line), line]));
     for (const line of lines) {
       const product = products.get(line.productId), old = previous.get(lineKey(line));
@@ -103,11 +113,36 @@ function createShoppingController(models = { User, Product }) {
       if ((!product || product.status !== 'active' || !validVariant(product, line) || stockForSize(product, line.size) < line.quantity) && !retained)
         fail(409, 'A cart item is unavailable in that size, colour or quantity. Refresh your cart.');
     }
-    const updated = await models.User.findOneAndUpdate({ _id: req.user.id, role: 'consumer', suspended: { $ne: true } },
+    const updated = await models.User.findOneAndUpdate({ _id: req.user.id, role: 'consumer', suspended: { $ne: true }, ...(newProductId !== undefined ? { cartItems: user.cartItems } : {}) },
       { $set: { cartItems: lines } }, { new: true, runValidators: true });
+    if (!updated && newProductId !== undefined) fail(409, 'Your cart changed in another tab. Refresh before adding this product.');
     if (!updated) fail(401, 'Please log in to continue.');
     res.json({ userId: req.user.id, cart: cartJson(lines, products) });
   }
-  return { getShop, setLike, setCart };
+  async function updateCartItem(req, res) {
+    const body = req.body;
+    if (!body || !mongoose.isObjectIdOrHexString(body.productId) || typeof body.size !== 'string' || body.size.length > 20 ||
+        typeof body.colour !== 'string' || body.colour.length > 20 || !Number.isInteger(body.quantity) || body.quantity < 1 || body.quantity > 10)
+      fail(400, 'Choose a valid product, colour, size and quantity.');
+    const user = await account(req);
+    const previous = (user.cartItems || []).map(line => ({ productId: String(line.productId), size: line.size || '', colour: line.colour || '', quantity: line.quantity }));
+    const source = previous.find(line => lineKey(line) === req.params.key);
+    if (!source) fail(409, 'This cart item changed or was removed. Reopen it from your cart.');
+    if (source.productId !== String(body.productId)) fail(400, 'Update the same product already in your cart.');
+    const target = { productId: source.productId, colour: body.colour, size: body.size, quantity: body.quantity };
+    const collision = previous.find(line => line !== source && lineKey(line) === lineKey(target));
+    if (collision) target.quantity += collision.quantity;
+    const products = await productsFor(previous.map(line => line.productId)), product = products.get(target.productId);
+    if (target.quantity > 10) fail(409, 'Combining these options would exceed 10 items. Reduce the quantity first.');
+    if (!product || product.status !== 'active' || !validVariant(product, target) || stockForSize(product, target.size) < target.quantity)
+      fail(409, 'These options or the combined quantity are unavailable. Choose an available size, colour and quantity.');
+    const lines = previous.filter(line => line !== source && line !== collision);
+    lines.splice(Math.min(previous.indexOf(source), lines.length), 0, target);
+    const updated = await models.User.findOneAndUpdate({ _id: req.user.id, role: 'consumer', suspended: { $ne: true }, cartItems: user.cartItems },
+      { $set: { cartItems: lines } }, { new: true, runValidators: true });
+    if (!updated) fail(409, 'Your cart changed in another tab. Refresh and try again.');
+    res.json({ userId: req.user.id, cart: cartJson(lines, products), key: lineKey(target) });
+  }
+  return { getShop, setLike, setCart, updateCartItem };
 }
 module.exports = { checkout, createShoppingController, ...createShoppingController() };

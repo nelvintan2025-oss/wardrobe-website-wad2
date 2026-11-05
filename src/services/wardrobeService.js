@@ -25,6 +25,12 @@ export const colours = [
   "Orange",
   "Multicolour",
 ];
+export const wardrobeColours = colours.filter(colour => colour !== 'Multicolour');
+export function clothingColours(item) {
+  const values = item?.source === 'store' ? [item.colour] : Array.isArray(item?.colours) && item.colours.length ? item.colours : [item?.colour];
+  return [...new Set(values.filter(value => colours.includes(value)))];
+}
+export const noOccasion = 'No specific occasion';
 export const styles = [
   "Minimalist",
   "Streetwear",
@@ -35,6 +41,7 @@ export const styles = [
   "Romantic"
 ];
 export const occasions = [
+  noOccasion,
   "University",
   "Presentation",
   "Interview",
@@ -193,7 +200,10 @@ function mutatePlanner(path, options) {
   plannerQueue = task.catch(() => {});
   return task;
 }
-export function addPlannerProduct(product, { colour = '', size = '' } = {}) {
-  return mutatePlanner('', send('POST', { productId: product.productId, colour, size }));
+export function addPlannerProduct(product, { colour = '', size = '', requireNewProduct = false } = {}) {
+  return mutatePlanner('', send('POST', { productId: product.productId, colour, size, ...(requireNewProduct ? { requireNewProduct: true } : {}) }));
+}
+export function updatePlannerProduct(key, product, { colour = '', size = '' } = {}) {
+  return mutatePlanner('/' + encodeURIComponent(key), send('PUT', { productId: product.productId, colour, size }));
 }
 export function removePlannerProduct(key) { return mutatePlanner('/' + encodeURIComponent(key), { method: 'DELETE' }); }
